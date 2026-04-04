@@ -1,0 +1,14 @@
+[package]
+name = "codepeek"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+codepeek-widgets.workspace = true
+ratatui.workspace = true
+color-eyre.workspace = true
+
+[lints]
+workspace = true
