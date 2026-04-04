@@ -1,4 +1,4 @@
-use codepeek_widgets::App;
+use codepeek_view::App;
 use color_eyre::Result;
 
 fn main() -> Result<()> {

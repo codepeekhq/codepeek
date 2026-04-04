@@ -6,7 +6,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-codepeek-widgets.workspace = true
+codepeek-view.workspace = true
 ratatui.workspace = true
 color-eyre.workspace = true
 

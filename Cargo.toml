@@ -3,7 +3,7 @@ resolver = "3"
 members = [
     "apps/tui",
     "crates/core",
-    "crates/widgets",
+    "crates/view",
 ]
 
 [workspace.package]
@@ -14,7 +14,7 @@ repository = "https://github.com/codepeekhq/codepeek"
 [workspace.dependencies]
 # Internal crates
 codepeek-core = { path = "crates/core" }
-codepeek-widgets = { path = "crates/widgets" }
+codepeek-view = { path = "crates/view" }
 
 # TUI
 ratatui = "0.30.0"
