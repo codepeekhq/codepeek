@@ -1,6 +1,7 @@
 [package]
 name = "codepeek-view"
 version = "0.1.0"
+description = "Presentation layer and UI components for codepeek"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true

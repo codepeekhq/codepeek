@@ -1,6 +1,7 @@
 [package]
 name = "codepeek"
 version = "0.1.0"
+description = "Terminal-native development tool for AI-assisted coding workflows"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
