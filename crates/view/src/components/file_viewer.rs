@@ -3,9 +3,8 @@ use std::path::PathBuf;
 use ratatui::Frame;
 use ratatui::crossterm::event::KeyEvent;
 use ratatui::layout::Rect;
-use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Padding, Paragraph};
 
 use codepeek_core::{ChangeMap, DiffHunk, DiffLine, HighlightSpan, HighlightedLine, LineChange};
 
@@ -135,21 +134,24 @@ impl FileViewer {
     }
 
     pub fn render(&self, frame: &mut Frame, area: Rect) {
+        let t = theme::current();
         let title = self
             .file_path
             .as_ref()
-            .map_or_else(|| " No File ".to_string(), |p| format!(" {} ", p.display()));
+            .map_or_else(|| " No file ".to_string(), |p| format!(" {} ", p.display()));
 
-        let diff_indicator = if self.show_diff { " [DIFF] " } else { "" };
-        let full_title = format!("{title}{diff_indicator}");
+        let mut title_spans = vec![Span::styled(title, ratatui::style::Style::new().fg(t.text))];
 
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(theme::BORDER_COLOR))
-            .title(Span::styled(
-                full_title,
-                Style::default().fg(theme::TITLE_COLOR),
+        if self.show_diff {
+            title_spans.push(Span::styled(
+                " diff ",
+                ratatui::style::Style::new().fg(t.accent),
             ));
+        }
+
+        let block = theme::focused_block()
+            .title(Line::from(title_spans))
+            .padding(Padding::new(1, 1, 0, 0));
 
         let inner = block.inner(area);
         let visible_height = inner.height as usize;
@@ -580,7 +582,7 @@ mod tests {
             .collect();
 
         assert!(
-            content.contains('\u{258e}'),
+            content.contains('\u{2502}'),
             "should show gutter mark for changed lines"
         );
     }
@@ -706,6 +708,6 @@ mod tests {
             .iter()
             .map(ratatui::buffer::Cell::symbol)
             .collect();
-        assert!(content.contains("[DIFF]"), "should show DIFF indicator");
+        assert!(content.contains("diff"), "should show diff indicator");
     }
 }

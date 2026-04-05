@@ -1,4 +1,3 @@
-use ratatui::style::Style;
 use ratatui::text::Span;
 
 use codepeek_core::HighlightSpan;
@@ -96,7 +95,10 @@ pub fn truncate_line(content: &str, max_length: usize) -> String {
 }
 
 pub fn dim_line_number(number: &str) -> Span<'static> {
-    Span::styled(format!("{number} "), Style::default().fg(theme::DIM_COLOR))
+    Span::styled(
+        format!("{number} "),
+        ratatui::style::Style::new().fg(theme::current().text_dim),
+    )
 }
 
 #[cfg(test)]

@@ -4,8 +4,7 @@ use std::time::Duration;
 use ratatui::DefaultTerminal;
 use ratatui::Frame;
 use ratatui::crossterm::event::{self, Event, KeyEventKind};
-use ratatui::layout::{Constraint, Layout};
-use ratatui::style::{Color, Style};
+use ratatui::layout::{Constraint, Layout, Margin};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
@@ -60,39 +59,51 @@ impl App {
     }
 
     fn render(&self, frame: &mut Frame) {
-        let area = frame.area();
+        let t = theme::current();
+        let full = frame.area();
+        frame.render_widget(
+            ratatui::widgets::Block::default().style(ratatui::style::Style::new().bg(t.base_bg)),
+            full,
+        );
 
-        let [main_area, status_area] =
-            Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(area);
+        let area = full.inner(Margin::new(config::OUTER_MARGIN, config::OUTER_MARGIN));
+
+        let [main_area, _gap, status_area] = Layout::vertical([
+            Constraint::Min(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
+        .areas(area);
 
         match self.focus {
             Focus::FileList => {
                 self.file_list.render(frame, main_area);
                 StatusBar::render(
                     &[
-                        ("q", "quit"),
                         ("\u{2191}\u{2193}", "navigate"),
-                        ("Enter", "open"),
+                        ("\u{23ce}", "open"),
                         ("r", "refresh"),
+                        ("q", "quit"),
                     ],
                     frame,
                     status_area,
                 );
             }
             Focus::FileViewer => {
-                let [left, right] = Layout::horizontal([
+                let [left, _gap, right] = Layout::horizontal([
                     Constraint::Percentage(config::FILE_LIST_WIDTH_PERCENT),
+                    Constraint::Length(config::PANEL_GAP),
                     Constraint::Percentage(config::FILE_VIEWER_WIDTH_PERCENT),
                 ])
                 .areas(main_area);
 
-                self.file_list.render(frame, left);
+                self.file_list.render_with_focus(frame, left, false);
                 self.file_viewer.render(frame, right);
                 StatusBar::render(
                     &[
-                        ("Esc", "back"),
                         ("\u{2191}\u{2193}", "scroll"),
                         ("d", "diff"),
+                        ("esc", "back"),
                         ("q", "quit"),
                     ],
                     frame,
@@ -103,14 +114,20 @@ impl App {
 
         if let Some(msg) = &self.error_message {
             let error_line = Line::from(vec![
-                Span::styled(" ERROR ", Style::default().fg(Color::White).bg(Color::Red)),
-                Span::styled(format!(" {msg}"), Style::default().fg(theme::DELETED_COLOR)),
+                Span::styled(
+                    " ERROR ",
+                    ratatui::style::Style::new().fg(t.base_bg).bg(t.error_bg),
+                ),
+                Span::styled(
+                    format!(" {msg}"),
+                    ratatui::style::Style::new().fg(t.error_fg),
+                ),
             ]);
             frame.render_widget(Paragraph::new(error_line), status_area);
         }
 
         if let Some(overlay) = &self.peek_overlay {
-            overlay.render(frame, area);
+            overlay.render(frame, full);
         }
     }
 
@@ -172,7 +189,6 @@ impl App {
 
         match std::fs::read(&path) {
             Ok(bytes) => {
-                // Binary heuristic: null byte in the first 8 KiB.
                 let check_len = bytes.len().min(config::BINARY_DETECTION_LIMIT);
                 if bytes[..check_len].contains(&0) {
                     self.file_viewer
@@ -194,22 +210,17 @@ impl App {
     fn open_with_highlighting(&mut self, path: &std::path::Path, content: &str, kind: &ChangeKind) {
         let highlighted = match self.highlighter.highlight(content, path) {
             Ok(lines) => lines,
-            Err(_) => {
-                // Fall back to plain text.
-                content
-                    .lines()
-                    .map(|l| codepeek_core::HighlightedLine {
-                        content: l.to_string(),
-                        spans: vec![],
-                    })
-                    .collect()
-            }
+            Err(_) => content
+                .lines()
+                .map(|l| codepeek_core::HighlightedLine {
+                    content: l.to_string(),
+                    spans: vec![],
+                })
+                .collect(),
         };
 
         let hunks = self.change_detector.compute_diff(path).unwrap_or_default();
         let mut change_map = ChangeMap::from_hunks(&hunks);
-
-        // For added files, mark every line as added since git has no prior version.
 
         if *kind == ChangeKind::Added {
             #[allow(clippy::cast_possible_truncation)]
@@ -347,7 +358,7 @@ mod tests {
             .iter()
             .map(ratatui::buffer::Cell::symbol)
             .collect();
-        assert!(content.contains("Files"));
+        assert!(content.contains("Changes"));
     }
 
     #[test]
@@ -416,7 +427,7 @@ mod tests {
             .iter()
             .map(ratatui::buffer::Cell::symbol)
             .collect();
-        assert!(content.contains("Files"), "should show file list");
+        assert!(content.contains("Changes"), "should show file list");
         assert!(content.contains("test.rs"), "should show file viewer");
     }
 
@@ -454,7 +465,6 @@ mod tests {
 
     #[test]
     fn refresh_failure_sets_error_message() {
-        // Build app with a working detector first, then swap.
         let mut app = App::new(
             Box::new(StubDetector::new(sample_files())),
             Box::new(StubHighlighter),
@@ -526,7 +536,7 @@ mod tests {
             .map(ratatui::buffer::Cell::symbol)
             .collect();
         assert!(
-            content.contains("r: refresh"),
+            content.contains("refresh"),
             "status bar should show refresh hint in file list mode"
         );
     }
@@ -553,7 +563,7 @@ mod tests {
             .map(ratatui::buffer::Cell::symbol)
             .collect();
         assert!(
-            content.contains("d: diff"),
+            content.contains("diff"),
             "status bar should show diff hint in file viewer mode"
         );
     }

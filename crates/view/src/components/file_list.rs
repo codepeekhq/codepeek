@@ -2,9 +2,8 @@ use codepeek_core::{ChangeKind, FileChange};
 use ratatui::Frame;
 use ratatui::crossterm::event::KeyEvent;
 use ratatui::layout::Rect;
-use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState};
+use ratatui::widgets::{List, ListItem, ListState, Padding};
 
 use crate::action::Action;
 use crate::keybindings;
@@ -18,24 +17,27 @@ pub struct FileList {
 
 impl FileList {
     pub fn new(files: Vec<FileChange>) -> Self {
-        let display_items = files
+        let display_items = Self::build_display_items(&files);
+        Self {
+            files,
+            display_items,
+            selected: 0,
+        }
+    }
+
+    fn build_display_items(files: &[FileChange]) -> Vec<(String, ChangeKind)> {
+        files
             .iter()
             .map(|f| {
-                let badge = theme::change_badge(&f.kind);
                 let label = match &f.kind {
                     ChangeKind::Renamed { from } => {
                         format!("{} \u{2192} {}", from.display(), f.path.display())
                     }
                     _ => f.path.display().to_string(),
                 };
-                (format!("{badge} {label}"), f.kind.clone())
+                (label, f.kind.clone())
             })
-            .collect();
-        Self {
-            files,
-            display_items,
-            selected: 0,
-        }
+            .collect()
     }
 
     pub fn handle_event(&mut self, key: KeyEvent) -> Action {
@@ -69,39 +71,70 @@ impl FileList {
     }
 
     pub fn render(&self, frame: &mut Frame, area: Rect) {
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(theme::BORDER_COLOR))
-            .title(Span::styled(
-                " Files ",
-                Style::default().fg(theme::TITLE_COLOR),
-            ));
+        self.render_with_focus(frame, area, true);
+    }
+
+    pub fn render_with_focus(&self, frame: &mut Frame, area: Rect, focused: bool) {
+        let t = theme::current();
+        let changed_count = self
+            .files
+            .iter()
+            .filter(|f| f.kind != ChangeKind::Unchanged)
+            .count();
+
+        let title_line = Line::from(vec![
+            Span::styled(" Changes ", ratatui::style::Style::new().fg(t.text)),
+            Span::styled(
+                format!("{changed_count} "),
+                ratatui::style::Style::new().fg(t.text_dim),
+            ),
+        ]);
+
+        let block = if focused {
+            theme::focused_block()
+        } else {
+            theme::rounded_block()
+        }
+        .title(title_line)
+        .padding(Padding::new(1, 1, 1, 0));
 
         let items: Vec<ListItem> = self
             .display_items
             .iter()
             .map(|(text, kind)| {
-                let badge_len = theme::change_badge(kind).len();
-                let badge_text = &text[..badge_len];
-                let rest = &text[badge_len..];
-                let rest_style = if *kind == ChangeKind::Deleted {
+                let badge = theme::change_badge(kind);
+                let label = theme::change_label(kind);
+                let badge_style = theme::badge_style(kind);
+
+                let file_style = if *kind == ChangeKind::Deleted {
                     theme::deleted_file_style()
                 } else if *kind == ChangeKind::Unchanged {
                     theme::unchanged_file_style()
                 } else {
-                    Style::default()
+                    ratatui::style::Style::new().fg(t.text)
                 };
-                let line = Line::from(vec![
-                    Span::styled(badge_text.to_string(), theme::badge_style(kind)),
-                    Span::styled(rest.to_string(), rest_style),
-                ]);
-                ListItem::new(line)
+
+                let mut spans = vec![
+                    Span::styled(badge.to_string(), badge_style),
+                    Span::styled("  ", ratatui::style::Style::new()),
+                    Span::styled(text.clone(), file_style),
+                ];
+
+                if !label.is_empty() {
+                    spans.push(Span::styled(
+                        format!("  {label}"),
+                        ratatui::style::Style::new().fg(t.text_dim),
+                    ));
+                }
+
+                ListItem::new(Line::from(spans))
             })
             .collect();
 
         let list = List::new(items)
             .block(block)
-            .highlight_style(theme::selected_style());
+            .highlight_style(theme::selected_style())
+            .highlight_spacing(ratatui::widgets::HighlightSpacing::Always);
 
         let mut state = ListState::default();
         state.select(Some(self.selected));
@@ -115,21 +148,8 @@ impl FileList {
     }
 
     pub fn update_files(&mut self, files: Vec<FileChange>) {
-        let display_items = files
-            .iter()
-            .map(|f| {
-                let badge = theme::change_badge(&f.kind);
-                let label = match &f.kind {
-                    ChangeKind::Renamed { from } => {
-                        format!("{} \u{2192} {}", from.display(), f.path.display())
-                    }
-                    _ => f.path.display().to_string(),
-                };
-                (format!("{badge} {label}"), f.kind.clone())
-            })
-            .collect();
+        self.display_items = Self::build_display_items(&files);
         self.files = files;
-        self.display_items = display_items;
         self.selected = 0;
     }
 
@@ -198,16 +218,13 @@ mod tests {
         let mut list = FileList::new(sample_files());
         assert_eq!(list.selected, 0);
 
-        // Move up from 0 stays at 0.
         list.handle_event(make_key(KeyCode::Up));
         assert_eq!(list.selected, 0);
 
-        // Move down to last.
         list.handle_event(make_key(KeyCode::Down));
         list.handle_event(make_key(KeyCode::Down));
         assert_eq!(list.selected, 2);
 
-        // Move down past last stays at last.
         list.handle_event(make_key(KeyCode::Down));
         assert_eq!(list.selected, 2);
     }
@@ -389,7 +406,32 @@ mod tests {
             .iter()
             .map(ratatui::buffer::Cell::symbol)
             .collect();
-        assert!(content.contains('D'), "should show D badge for deleted");
+        assert!(
+            content.contains('\u{2715}'),
+            "should show ✕ badge for deleted"
+        );
         assert!(content.contains("gone.rs"), "should show file path");
+    }
+
+    #[test]
+    fn render_shows_changes_title() {
+        let list = FileList::new(sample_files());
+
+        let backend = TestBackend::new(50, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| list.render(frame, frame.area()))
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let content: String = buffer
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(
+            content.contains("Changes"),
+            "should show Changes section title"
+        );
     }
 }

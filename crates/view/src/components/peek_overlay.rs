@@ -3,9 +3,8 @@ use std::path::PathBuf;
 use ratatui::Frame;
 use ratatui::crossterm::event::KeyEvent;
 use ratatui::layout::Rect;
-use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use ratatui::widgets::{Clear, Padding, Paragraph};
 
 use codepeek_core::{HighlightSpan, HighlightedLine};
 
@@ -82,14 +81,14 @@ impl PeekOverlay {
         );
         frame.render_widget(Clear, popup);
 
+        let t = theme::current();
         let title = format!(" Deleted: {} ", self.file_path.display());
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(theme::DELETED_COLOR))
+        let block = theme::destructive_block()
             .title(Span::styled(
                 title,
-                Style::default().fg(theme::DELETED_COLOR),
-            ));
+                ratatui::style::Style::new().fg(t.destructive),
+            ))
+            .padding(Padding::new(1, 1, 0, 0));
 
         let inner = block.inner(popup);
         let visible_height = inner.height as usize;

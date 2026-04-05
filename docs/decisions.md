@@ -29,3 +29,8 @@
 - 2026-04-05: No config crate — config stays in view modules and app binary until user-facing config grows enough to justify a dedicated crate
 - 2026-04-05: No runtime dynamic loading of tree-sitter grammars — requires `unsafe`, violates workspace-wide `forbid(unsafe_code)`
 - 2026-04-05: `serde`/`toml`/`dirs` dependencies only in `apps/tui`, not in library crates — config deserialization is an app concern
+- 2026-04-05: Catppuccin Mocha as the default color theme, with Palette/Theme struct architecture for first-class theming support
+- 2026-04-05: Theme architecture: `Palette` (raw color values) + `Theme` (semantic tokens built from palette via `from_palette()`) — components only reference semantic tokens, never raw palette colors
+- 2026-04-05: `LazyLock<Theme>` for global theme access via `theme::current()` — zero-cost after init, avoids threading `&Theme` through all render signatures; migrate to pass-through `&Theme` when runtime theme switching is needed
+- 2026-04-05: Free function re-exports in theme module (e.g., `theme::selected_style()`) delegate to `current()` — keeps call sites unchanged while backing everything with the Theme struct
+- 2026-04-05: UI visual refinements — rounded borders, Unicode change badges (+/●/✕/‣/·), outer margin, panel gaps, focused vs unfocused border distinction

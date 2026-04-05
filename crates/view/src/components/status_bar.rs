@@ -1,6 +1,5 @@
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
@@ -10,6 +9,7 @@ pub struct StatusBar;
 
 impl StatusBar {
     pub fn render(hints: &[(&str, &str)], frame: &mut Frame, area: Rect) {
+        let t = theme::current();
         let spans: Vec<Span> = hints
             .iter()
             .enumerate()
@@ -17,14 +17,18 @@ impl StatusBar {
                 let mut parts = vec![
                     Span::styled(
                         (*key).to_string(),
-                        Style::default()
-                            .fg(theme::TITLE_COLOR)
-                            .add_modifier(Modifier::BOLD),
+                        ratatui::style::Style::new().fg(t.status_key),
                     ),
-                    Span::styled(format!(": {desc}"), Style::default().fg(theme::DIM_COLOR)),
+                    Span::styled(
+                        format!(" {desc}"),
+                        ratatui::style::Style::new().fg(t.status_desc),
+                    ),
                 ];
                 if i + 1 < hints.len() {
-                    parts.push(Span::raw("  "));
+                    parts.push(Span::styled(
+                        "   ",
+                        ratatui::style::Style::new().fg(t.status_separator),
+                    ));
                 }
                 parts
             })
