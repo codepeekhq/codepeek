@@ -7,6 +7,7 @@ pub enum ChangeKind {
     Modified,
     Deleted,
     Renamed { from: PathBuf },
+    Unchanged,
 }
 
 #[derive(Debug, Clone)]
@@ -23,8 +24,10 @@ mod tests {
     #[test]
     fn change_kind_equality() {
         assert_eq!(ChangeKind::Added, ChangeKind::Added);
+        assert_eq!(ChangeKind::Unchanged, ChangeKind::Unchanged);
         assert_ne!(ChangeKind::Added, ChangeKind::Modified);
         assert_ne!(ChangeKind::Added, ChangeKind::Deleted);
+        assert_ne!(ChangeKind::Unchanged, ChangeKind::Modified);
     }
 
     #[test]

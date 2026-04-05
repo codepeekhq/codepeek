@@ -346,7 +346,7 @@ mod tests {
             .iter()
             .map(ratatui::buffer::Cell::symbol)
             .collect();
-        assert!(content.contains("Changed Files"));
+        assert!(content.contains("Files"));
     }
 
     #[test]
@@ -415,7 +415,7 @@ mod tests {
             .iter()
             .map(ratatui::buffer::Cell::symbol)
             .collect();
-        assert!(content.contains("Changed Files"), "should show file list");
+        assert!(content.contains("Files"), "should show file list");
         assert!(content.contains("test.rs"), "should show file viewer");
     }
 

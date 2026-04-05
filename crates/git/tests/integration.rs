@@ -66,9 +66,20 @@ fn added_file_detected() {
     let detector = GitChangeDetector::open(dir.path()).expect("failed to open detector");
     let changes = detector.detect_changes().expect("failed to detect changes");
 
-    assert_eq!(changes.len(), 1);
-    assert_eq!(changes[0].path, Path::new("new_file.txt"));
-    assert_eq!(changes[0].kind, ChangeKind::Added);
+    let added: Vec<_> = changes
+        .iter()
+        .filter(|c| c.kind == ChangeKind::Added)
+        .collect();
+    assert_eq!(added.len(), 1);
+    assert_eq!(added[0].path, Path::new("new_file.txt"));
+
+    // The committed hello.txt should appear as Unchanged
+    let unchanged: Vec<_> = changes
+        .iter()
+        .filter(|c| c.kind == ChangeKind::Unchanged)
+        .collect();
+    assert_eq!(unchanged.len(), 1);
+    assert_eq!(unchanged[0].path, Path::new("hello.txt"));
 }
 
 #[test]

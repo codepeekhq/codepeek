@@ -70,7 +70,7 @@ impl FileList {
             .borders(Borders::ALL)
             .border_style(Style::default().fg(theme::BORDER_COLOR))
             .title(Span::styled(
-                " Changed Files ",
+                " Files ",
                 Style::default().fg(theme::TITLE_COLOR),
             ));
 
@@ -83,6 +83,8 @@ impl FileList {
                 let rest = &text[badge_len..];
                 let rest_style = if *kind == ChangeKind::Deleted {
                     theme::deleted_file_style()
+                } else if *kind == ChangeKind::Unchanged {
+                    theme::unchanged_file_style()
                 } else {
                     Style::default()
                 };
@@ -334,6 +336,33 @@ mod tests {
         let mut list = FileList::new(sample_files());
         list.handle_event(make_key(KeyCode::Char('j')));
         assert_eq!(list.selected, 1);
+    }
+
+    #[test]
+    fn unchanged_file_renders_with_dim_style() {
+        let files = vec![FileChange {
+            path: PathBuf::from("stable.rs"),
+            kind: ChangeKind::Unchanged,
+            mtime: SystemTime::now(),
+        }];
+        let list = FileList::new(files);
+
+        let backend = TestBackend::new(40, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| list.render(frame, frame.area()))
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let content: String = buffer
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(
+            content.contains("stable.rs"),
+            "should show unchanged file path"
+        );
     }
 
     #[test]

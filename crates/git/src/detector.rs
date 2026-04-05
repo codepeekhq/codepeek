@@ -1,4 +1,5 @@
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::SystemTime;
 
@@ -30,6 +31,10 @@ impl ChangeDetector for GitChangeDetector {
             return Ok(Vec::new());
         }
 
+        let workdir = repo.workdir().ok_or_else(|| {
+            ChangeError::StatusFailed("bare repository has no working directory".into())
+        })?;
+
         let statuses = repo
             .statuses(Some(
                 StatusOptions::new()
@@ -38,11 +43,7 @@ impl ChangeDetector for GitChangeDetector {
             ))
             .map_err(|e| ChangeError::StatusFailed(Box::new(e)))?;
 
-        let workdir = repo.workdir().ok_or_else(|| {
-            ChangeError::StatusFailed("bare repository has no working directory".into())
-        })?;
-
-        let mut changes = Vec::new();
+        let mut file_map: HashMap<PathBuf, FileChange> = HashMap::new();
 
         for entry in statuses.iter() {
             let Some(rel_path) = entry.path() else {
@@ -75,15 +76,31 @@ impl ChangeDetector for GitChangeDetector {
                     .unwrap_or(SystemTime::UNIX_EPOCH)
             };
 
-            changes.push(FileChange {
-                path: rel_path.into(),
-                kind,
-                mtime,
-            });
+            let path = PathBuf::from(rel_path);
+            file_map.insert(path.clone(), FileChange { path, kind, mtime });
         }
 
-        changes.sort_by(|a, b| b.mtime.cmp(&a.mtime));
-        Ok(changes)
+        let index = repo
+            .index()
+            .map_err(|e| ChangeError::StatusFailed(Box::new(e)))?;
+
+        for entry in index.iter() {
+            let path_str = String::from_utf8_lossy(&entry.path);
+            let path = PathBuf::from(path_str.as_ref());
+            file_map.entry(path.clone()).or_insert_with(|| {
+                let mtime = std::fs::metadata(workdir.join(&*path_str))
+                    .and_then(|m| m.modified())
+                    .unwrap_or(SystemTime::UNIX_EPOCH);
+                FileChange {
+                    path,
+                    kind: ChangeKind::Unchanged,
+                    mtime,
+                }
+            });
+        }
+        let mut files: Vec<FileChange> = file_map.into_values().collect();
+        files.sort_by(|a, b| b.mtime.cmp(&a.mtime));
+        Ok(files)
     }
 
     fn compute_diff(&self, path: &Path) -> Result<Vec<DiffHunk>, ChangeError> {

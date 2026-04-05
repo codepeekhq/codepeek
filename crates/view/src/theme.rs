@@ -25,6 +25,7 @@ pub fn badge_style(kind: &ChangeKind) -> Style {
         ChangeKind::Modified => MODIFIED_COLOR,
         ChangeKind::Deleted => DELETED_COLOR,
         ChangeKind::Renamed { .. } => RENAMED_COLOR,
+        ChangeKind::Unchanged => DIM_COLOR,
     };
     Style::default().fg(color).add_modifier(Modifier::BOLD)
 }
@@ -35,6 +36,7 @@ pub fn change_badge(kind: &ChangeKind) -> &'static str {
         ChangeKind::Modified => "M",
         ChangeKind::Deleted => "D",
         ChangeKind::Renamed { .. } => "R",
+        ChangeKind::Unchanged => " ",
     }
 }
 
@@ -94,6 +96,10 @@ pub fn deleted_file_style() -> Style {
     Style::default().fg(DIM_COLOR).add_modifier(Modifier::DIM)
 }
 
+pub fn unchanged_file_style() -> Style {
+    Style::default().fg(DIM_COLOR)
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -111,6 +117,7 @@ mod tests {
             }),
             "R"
         );
+        assert_eq!(change_badge(&ChangeKind::Unchanged), " ");
     }
 
     #[test]
@@ -128,6 +135,9 @@ mod tests {
             from: PathBuf::from("old.rs"),
         });
         assert_eq!(renamed.fg, Some(RENAMED_COLOR));
+
+        let unchanged = badge_style(&ChangeKind::Unchanged);
+        assert_eq!(unchanged.fg, Some(DIM_COLOR));
     }
 
     #[test]
@@ -211,5 +221,12 @@ mod tests {
         let style = deleted_file_style();
         assert_eq!(style.fg, Some(DIM_COLOR));
         assert!(style.add_modifier.contains(Modifier::DIM));
+    }
+
+    #[test]
+    fn unchanged_file_style_is_gray() {
+        let style = unchanged_file_style();
+        assert_eq!(style.fg, Some(DIM_COLOR));
+        assert!(!style.add_modifier.contains(Modifier::DIM));
     }
 }
