@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use ratatui::Frame;
-use ratatui::crossterm::event::{KeyCode, KeyEvent};
+use ratatui::crossterm::event::KeyEvent;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
@@ -10,13 +10,13 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use codepeek_core::{ChangeMap, DiffHunk, DiffLine, HighlightSpan, HighlightedLine, LineChange};
 
 use crate::action::Action;
+use crate::config;
+use crate::keybindings;
 use crate::render_helpers::{
     build_highlighted_spans_owned, dim_line_number, line_number_width, truncate_line,
 };
 use crate::theme;
 use crate::theme::GutterMark;
-
-const MAX_LINE_LENGTH: usize = 500;
 
 struct ViewerLine {
     line_number: String,
@@ -96,36 +96,33 @@ impl FileViewer {
     }
 
     pub fn handle_event(&mut self, key: KeyEvent) -> Action {
-        match key.code {
-            KeyCode::Up | KeyCode::Char('k') => {
-                if self.scroll_offset > 0 {
-                    self.scroll_offset -= 1;
-                }
-                Action::Noop
+        if keybindings::is_move_up(&key) {
+            if self.scroll_offset > 0 {
+                self.scroll_offset -= 1;
             }
-            KeyCode::Down | KeyCode::Char('j') => {
-                let max = self.total_visible_lines().saturating_sub(1);
-                if self.scroll_offset < max {
-                    self.scroll_offset += 1;
-                }
-                Action::Noop
+            Action::Noop
+        } else if keybindings::is_move_down(&key) {
+            let max = self.total_visible_lines().saturating_sub(1);
+            if self.scroll_offset < max {
+                self.scroll_offset += 1;
             }
-            KeyCode::PageUp => {
-                self.scroll_offset = self.scroll_offset.saturating_sub(20);
-                Action::Noop
-            }
-            KeyCode::PageDown => {
-                let max = self.total_visible_lines().saturating_sub(1);
-                self.scroll_offset = (self.scroll_offset + 20).min(max);
-                Action::Noop
-            }
-            KeyCode::Char('d') => {
-                self.show_diff = !self.show_diff;
-                Action::ToggleDiff
-            }
-            KeyCode::Esc => Action::Back,
-            KeyCode::Char('q') => Action::Quit,
-            _ => Action::Noop,
+            Action::Noop
+        } else if keybindings::is_page_up(&key) {
+            self.scroll_offset = self.scroll_offset.saturating_sub(config::PAGE_SCROLL_LINES);
+            Action::Noop
+        } else if keybindings::is_page_down(&key) {
+            let max = self.total_visible_lines().saturating_sub(1);
+            self.scroll_offset = (self.scroll_offset + config::PAGE_SCROLL_LINES).min(max);
+            Action::Noop
+        } else if keybindings::is_toggle_diff(&key) {
+            self.show_diff = !self.show_diff;
+            Action::ToggleDiff
+        } else if keybindings::is_back(&key) {
+            Action::Back
+        } else if keybindings::is_quit(&key) {
+            Action::Quit
+        } else {
+            Action::Noop
         }
     }
 
@@ -219,7 +216,7 @@ impl FileViewer {
 
             if let Some(removed) = removed_before.get(&line_num) {
                 for dl in removed {
-                    let content = truncate_line(&dl.content, MAX_LINE_LENGTH);
+                    let content = truncate_line(&dl.content, config::MAX_LINE_LENGTH);
                     let spans = vec![
                         Span::styled("   - ", theme::diff_removed_style()),
                         Span::styled(content, theme::diff_removed_style()),
@@ -233,7 +230,7 @@ impl FileViewer {
             {
                 let gutter_mark_text = theme::gutter_text(&vl.gutter_mark);
                 let gutter_mark_style = theme::gutter_style(&vl.gutter_mark);
-                let content = truncate_line(&vl.content, MAX_LINE_LENGTH);
+                let content = truncate_line(&vl.content, config::MAX_LINE_LENGTH);
                 let spans = vec![
                     Span::styled(format!("{} ", vl.line_number), theme::diff_added_style()),
                     Span::styled(gutter_mark_text, gutter_mark_style),
@@ -250,7 +247,7 @@ impl FileViewer {
         for (&key, removed) in &removed_before {
             if key >= after_last {
                 for dl in removed {
-                    let content = truncate_line(&dl.content, MAX_LINE_LENGTH);
+                    let content = truncate_line(&dl.content, config::MAX_LINE_LENGTH);
                     let spans = vec![
                         Span::styled("   - ", theme::diff_removed_style()),
                         Span::styled(content, theme::diff_removed_style()),
@@ -280,7 +277,7 @@ fn render_viewer_line(vl: &ViewerLine) -> Line<'_> {
     spans.extend(build_highlighted_spans_owned(
         &vl.content,
         &vl.spans,
-        MAX_LINE_LENGTH,
+        config::MAX_LINE_LENGTH,
     ));
     Line::from(spans)
 }
@@ -436,9 +433,10 @@ mod tests {
             .collect();
 
         let x_count = content.matches('x').count();
+        let max = config::MAX_LINE_LENGTH;
         assert!(
-            x_count <= MAX_LINE_LENGTH,
-            "line should be truncated at {MAX_LINE_LENGTH} chars, found {x_count}"
+            x_count <= max,
+            "line should be truncated at {max} chars, found {x_count}"
         );
         assert!(
             content.contains('\u{2026}'),

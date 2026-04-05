@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use ratatui::Frame;
-use ratatui::crossterm::event::{KeyCode, KeyEvent};
+use ratatui::crossterm::event::KeyEvent;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
@@ -10,6 +10,8 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use codepeek_core::{HighlightSpan, HighlightedLine};
 
 use crate::action::Action;
+use crate::config;
+use crate::keybindings;
 use crate::render_helpers::{build_highlighted_spans, dim_line_number, line_number_width};
 use crate::theme;
 
@@ -46,37 +48,38 @@ impl PeekOverlay {
     }
 
     pub fn handle_event(&mut self, key: KeyEvent) -> Action {
-        match key.code {
-            KeyCode::Up | KeyCode::Char('k') => {
-                if self.scroll_offset > 0 {
-                    self.scroll_offset -= 1;
-                }
-                Action::Noop
+        if keybindings::is_move_up(&key) {
+            if self.scroll_offset > 0 {
+                self.scroll_offset -= 1;
             }
-            KeyCode::Down | KeyCode::Char('j') => {
-                if self.scroll_offset + 1 < self.display_lines.len() {
-                    self.scroll_offset += 1;
-                }
-                Action::Noop
+            Action::Noop
+        } else if keybindings::is_move_down(&key) {
+            if self.scroll_offset + 1 < self.display_lines.len() {
+                self.scroll_offset += 1;
             }
-            KeyCode::PageUp => {
-                self.scroll_offset = self.scroll_offset.saturating_sub(20);
-                Action::Noop
-            }
-            KeyCode::PageDown => {
-                let max = self.display_lines.len().saturating_sub(1);
-                self.scroll_offset = (self.scroll_offset + 20).min(max);
-                Action::Noop
-            }
-            KeyCode::Esc => Action::DismissPeek,
-            KeyCode::Char('q') => Action::Quit,
-            _ => Action::Noop,
+            Action::Noop
+        } else if keybindings::is_page_up(&key) {
+            self.scroll_offset = self.scroll_offset.saturating_sub(config::PAGE_SCROLL_LINES);
+            Action::Noop
+        } else if keybindings::is_page_down(&key) {
+            let max = self.display_lines.len().saturating_sub(1);
+            self.scroll_offset = (self.scroll_offset + config::PAGE_SCROLL_LINES).min(max);
+            Action::Noop
+        } else if keybindings::is_back(&key) {
+            Action::DismissPeek
+        } else if keybindings::is_quit(&key) {
+            Action::Quit
+        } else {
+            Action::Noop
         }
     }
 
     pub fn render(&self, frame: &mut Frame, area: Rect) {
-        let popup = centered_rect(area, 70, 80);
-
+        let popup = centered_rect(
+            area,
+            config::POPUP_WIDTH_PERCENT,
+            config::POPUP_HEIGHT_PERCENT,
+        );
         frame.render_widget(Clear, popup);
 
         let title = format!(" Deleted: {} ", self.file_path.display());

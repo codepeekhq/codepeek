@@ -23,3 +23,9 @@
 - 2026-04-05: Shared rendering helpers (`build_highlighted_spans`, `line_number_width`, `truncate_line`) extracted to `crates/view/src/render_helpers.rs` to avoid duplication between components
 - 2026-04-05: Test-only methods on private components use `#[cfg(test)]` instead of `#[allow(dead_code)]`
 - 2026-04-05: git2 status API does not detect renames without `find_similar()` — staged rename appears as delete+add pair
+- 2026-04-05: Centralized keybindings in `crates/view/src/keybindings.rs` — components call predicate functions instead of matching `KeyCode` directly
+- 2026-04-05: Centralized behavior constants in `crates/view/src/config.rs` — tick rate, scroll lines, line length limits, layout percentages
+- 2026-04-05: Config-gated language support via `TreeSitter::with_languages()` — config file at `~/.config/codepeek/config.toml` controls which tree-sitter languages are active; defaults to all
+- 2026-04-05: No config crate — config stays in view modules and app binary until user-facing config grows enough to justify a dedicated crate
+- 2026-04-05: No runtime dynamic loading of tree-sitter grammars — requires `unsafe`, violates workspace-wide `forbid(unsafe_code)`
+- 2026-04-05: `serde`/`toml`/`dirs` dependencies only in `apps/tui`, not in library crates — config deserialization is an app concern

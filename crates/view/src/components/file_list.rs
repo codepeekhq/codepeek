@@ -1,12 +1,13 @@
 use codepeek_core::{ChangeKind, FileChange};
 use ratatui::Frame;
-use ratatui::crossterm::event::{KeyCode, KeyEvent};
+use ratatui::crossterm::event::KeyEvent;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState};
 
 use crate::action::Action;
+use crate::keybindings;
 use crate::theme;
 
 pub struct FileList {
@@ -39,29 +40,31 @@ impl FileList {
 
     pub fn handle_event(&mut self, key: KeyEvent) -> Action {
         if self.files.is_empty() {
-            return match key.code {
-                KeyCode::Char('q') => Action::Quit,
-                _ => Action::Noop,
+            return if keybindings::is_quit(&key) {
+                Action::Quit
+            } else {
+                Action::Noop
             };
         }
 
-        match key.code {
-            KeyCode::Up | KeyCode::Char('k') => {
-                if self.selected > 0 {
-                    self.selected -= 1;
-                }
-                Action::Noop
+        if keybindings::is_move_up(&key) {
+            if self.selected > 0 {
+                self.selected -= 1;
             }
-            KeyCode::Down | KeyCode::Char('j') => {
-                if self.selected + 1 < self.files.len() {
-                    self.selected += 1;
-                }
-                Action::Noop
+            Action::Noop
+        } else if keybindings::is_move_down(&key) {
+            if self.selected + 1 < self.files.len() {
+                self.selected += 1;
             }
-            KeyCode::Enter => Action::SelectFile(self.selected),
-            KeyCode::Char('r') => Action::Refresh,
-            KeyCode::Char('q') => Action::Quit,
-            _ => Action::Noop,
+            Action::Noop
+        } else if keybindings::is_confirm(&key) {
+            Action::SelectFile(self.selected)
+        } else if keybindings::is_refresh(&key) {
+            Action::Refresh
+        } else if keybindings::is_quit(&key) {
+            Action::Quit
+        } else {
+            Action::Noop
         }
     }
 

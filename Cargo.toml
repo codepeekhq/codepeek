@@ -49,6 +49,11 @@ tree-sitter-yaml = "0.7.2"
 tree-sitter-lua = "0.5.0"
 tree-sitter-md = "0.5.3"
 
+# Configuration
+serde = { version = "1.0.228", features = ["derive"] }
+toml = "1.1.2"
+dirs = "6.0.0"
+
 # Error handling
 color-eyre = "0.6.5"
 thiserror = "2.0.18"

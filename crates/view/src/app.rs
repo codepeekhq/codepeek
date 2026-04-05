@@ -13,9 +13,8 @@ use codepeek_core::{ChangeDetector, ChangeKind, ChangeMap, SyntaxHighlighter};
 
 use crate::action::Action;
 use crate::components::{FileList, FileViewer, PeekOverlay, StatusBar};
+use crate::config;
 use crate::theme;
-
-const TICK_RATE: Duration = Duration::from_millis(16);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Focus {
@@ -81,9 +80,11 @@ impl App {
                 );
             }
             Focus::FileViewer => {
-                let [left, right] =
-                    Layout::horizontal([Constraint::Percentage(30), Constraint::Percentage(70)])
-                        .areas(main_area);
+                let [left, right] = Layout::horizontal([
+                    Constraint::Percentage(config::FILE_LIST_WIDTH_PERCENT),
+                    Constraint::Percentage(config::FILE_VIEWER_WIDTH_PERCENT),
+                ])
+                .areas(main_area);
 
                 self.file_list.render(frame, left);
                 self.file_viewer.render(frame, right);
@@ -114,7 +115,7 @@ impl App {
     }
 
     fn handle_events(&mut self) -> io::Result<()> {
-        if event::poll(TICK_RATE)? {
+        if event::poll(config::TICK_RATE)? {
             loop {
                 if let Event::Key(key) = event::read()?
                     && key.kind == KeyEventKind::Press
@@ -172,7 +173,7 @@ impl App {
         match std::fs::read(&path) {
             Ok(bytes) => {
                 // Binary heuristic: null byte in the first 8 KiB.
-                let check_len = bytes.len().min(8192);
+                let check_len = bytes.len().min(config::BINARY_DETECTION_LIMIT);
                 if bytes[..check_len].contains(&0) {
                     self.file_viewer
                         .load(path, &format!("[ Binary file ({} bytes) ]", bytes.len()));

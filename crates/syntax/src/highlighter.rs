@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::Path;
 
 use tree_sitter_highlight::{HighlightConfiguration, HighlightEvent, Highlighter};
@@ -59,12 +60,33 @@ const HIGHLIGHT_NAMES: &[&str] = &[
 
 pub struct TreeSitter {
     highlighter: Highlighter,
+    enabled_languages: Option<HashSet<String>>,
 }
 
 impl TreeSitter {
+    /// Creates a `TreeSitter` highlighter with all compiled-in languages enabled.
     pub fn new() -> Self {
         Self {
             highlighter: Highlighter::new(),
+            enabled_languages: None,
+        }
+    }
+
+    /// Creates a `TreeSitter` highlighter restricted to the given language names.
+    ///
+    /// Language names should match those returned by `detect_language` (e.g. "rust",
+    /// "python", "javascript"). Languages not in the set will be treated as unsupported.
+    pub fn with_languages(languages: HashSet<String>) -> Self {
+        Self {
+            highlighter: Highlighter::new(),
+            enabled_languages: Some(languages),
+        }
+    }
+
+    fn is_language_enabled(&self, lang: &str) -> bool {
+        match &self.enabled_languages {
+            None => true,
+            Some(set) => set.contains(lang),
         }
     }
 }
@@ -84,6 +106,12 @@ impl SyntaxHighlighter for TreeSitter {
         let lang_name = detect_language(path).ok_or_else(|| SyntaxError::UnsupportedLanguage {
             path: path.to_path_buf(),
         })?;
+
+        if !self.is_language_enabled(lang_name) {
+            return Err(SyntaxError::UnsupportedLanguage {
+                path: path.to_path_buf(),
+            });
+        }
 
         let (language, highlights_query, injections_query) = get_language_config(lang_name)
             .ok_or_else(|| SyntaxError::UnsupportedLanguage {
@@ -623,5 +651,76 @@ mod tests {
         assert_eq!(result[1].spans.len(), 1);
         assert_eq!(result[1].spans[0].start, 0);
         assert_eq!(result[1].spans[0].end, 2);
+    }
+
+    #[test]
+    fn with_languages_enables_only_specified() {
+        let languages: HashSet<String> = ["rust"].iter().map(|s| (*s).to_string()).collect();
+        let mut hl = TreeSitter::with_languages(languages);
+
+        // Rust should work.
+        let result = hl.highlight("fn main() {}", Path::new("test.rs"));
+        assert!(result.is_ok());
+
+        // Python should be rejected.
+        let result = hl.highlight("def hello(): pass", Path::new("test.py"));
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            codepeek_core::SyntaxError::UnsupportedLanguage { .. }
+        ));
+    }
+
+    #[test]
+    fn new_enables_all_languages() {
+        let mut hl = TreeSitter::new();
+        // Both rust and python should work with the default constructor.
+        assert!(hl.highlight("fn x() {}", Path::new("t.rs")).is_ok());
+        assert!(hl.highlight("def f(): pass", Path::new("t.py")).is_ok());
+    }
+
+    #[test]
+    fn with_empty_languages_disables_all() {
+        let mut hl = TreeSitter::with_languages(HashSet::new());
+        let result = hl.highlight("fn main() {}", Path::new("test.rs"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn supported_languages_matches_get_language_config() {
+        let config_languages: Vec<&str> = [
+            "rust",
+            "python",
+            "javascript",
+            "jsx",
+            "typescript",
+            "tsx",
+            "go",
+            "c",
+            "cpp",
+            "java",
+            "ruby",
+            "toml",
+            "json",
+            "bash",
+            "css",
+            "html",
+            "yaml",
+            "lua",
+            "markdown",
+        ]
+        .into_iter()
+        .collect();
+
+        for lang in &config_languages {
+            assert!(
+                get_language_config(lang).is_some(),
+                "get_language_config should support '{lang}'"
+            );
+            assert!(
+                crate::SUPPORTED_LANGUAGES.contains(lang),
+                "SUPPORTED_LANGUAGES should include '{lang}'"
+            );
+        }
     }
 }
