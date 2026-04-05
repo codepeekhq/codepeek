@@ -26,7 +26,6 @@ impl ChangeDetector for GitChangeDetector {
     fn detect_changes(&self) -> Result<Vec<FileChange>, ChangeError> {
         let repo = self.repo.lock().expect("repo mutex poisoned");
 
-        // Fresh repo with no commits: return empty
         if repo.head().is_err() {
             return Ok(Vec::new());
         }

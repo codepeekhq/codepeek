@@ -8,12 +8,8 @@ use codepeek_core::{HighlightSpan, HighlightedLine, SyntaxError, SyntaxHighlight
 use crate::languages::detect_language;
 use crate::mapping::map_highlight;
 
-/// The ordered list of highlight names we recognize.
-///
-/// The index in this array corresponds to the `Highlight` index
-/// returned by tree-sitter-highlight events. We call
-/// `HighlightConfiguration::configure` with this list so that
-/// tree-sitter maps its capture names to our indices.
+// Indices here correspond to tree-sitter `Highlight` event indices.
+// `HighlightConfiguration::configure` maps capture names to these positions.
 const HIGHLIGHT_NAMES: &[&str] = &[
     "keyword",
     "function",
@@ -61,10 +57,6 @@ const HIGHLIGHT_NAMES: &[&str] = &[
     "variable.member",
 ];
 
-/// Syntax highlighter backed by tree-sitter.
-///
-/// Wraps `tree_sitter_highlight::Highlighter` and creates
-/// `HighlightConfiguration` instances on demand for each language.
 pub struct TreeSitter {
     highlighter: Highlighter,
 }
@@ -124,11 +116,8 @@ impl SyntaxHighlighter for TreeSitter {
     }
 }
 
-/// Returns the tree-sitter language parser and highlight queries for a given language name.
-///
-/// Each grammar crate bundles its own highlight queries as compile-time constants,
-/// ensuring they are always available (unlike `tree-sitter-language-pack` from crates.io
-/// which does not bundle `.scm` files).
+// Each grammar crate bundles its own .scm queries as compile-time constants,
+// unlike tree-sitter-language-pack which doesn't ship .scm files.
 fn get_language_config(lang_name: &str) -> Option<(LanguageFn, &'static str, &'static str)> {
     match lang_name {
         "rust" => Some((
@@ -148,8 +137,6 @@ fn get_language_config(lang_name: &str) -> Option<(LanguageFn, &'static str, &'s
         )),
         "jsx" => Some((
             tree_sitter_javascript::LANGUAGE,
-            // Combine base JS highlights with JSX-specific highlights.
-            // Both are static strings, so we leak a concatenated copy.
             tree_sitter_javascript::JSX_HIGHLIGHT_QUERY,
             tree_sitter_javascript::INJECTIONS_QUERY,
         )),
@@ -228,7 +215,6 @@ fn get_language_config(lang_name: &str) -> Option<(LanguageFn, &'static str, &'s
     }
 }
 
-/// A no-op highlighter that returns lines without syntax spans.
 pub struct Noop;
 
 impl SyntaxHighlighter for Noop {
@@ -247,12 +233,6 @@ impl SyntaxHighlighter for Noop {
     }
 }
 
-/// Walk the highlight events and produce per-line output.
-///
-/// The event stream from tree-sitter-highlight interleaves `Source`,
-/// `HighlightStart`, and `HighlightEnd` events. We maintain a stack
-/// of active highlights and split source text by newlines to build
-/// `HighlightedLine` values with line-relative byte offsets.
 fn build_highlighted_lines(
     source: &str,
     events: impl Iterator<Item = Result<HighlightEvent, tree_sitter_highlight::Error>>,
@@ -312,7 +292,6 @@ fn build_highlighted_lines(
     Ok(lines)
 }
 
-/// Add highlight spans for a byte range that may cross line boundaries.
 fn add_spans_for_range(
     source: &[u8],
     start: usize,
@@ -548,6 +527,77 @@ mod tests {
             result[0].spans[0].kind,
             codepeek_core::HighlightKind::Keyword
         );
+    }
+
+    #[test]
+    fn go_snippet_has_keyword() {
+        let source = "package main\n\nfunc main() {}";
+        let mut hl = TreeSitter::new();
+        let result = hl.highlight(source, Path::new("main.go")).unwrap();
+        let has_keyword = result[0]
+            .spans
+            .iter()
+            .any(|s| s.kind == codepeek_core::HighlightKind::Keyword);
+        assert!(
+            has_keyword,
+            "expected 'package' to be highlighted as Keyword"
+        );
+    }
+
+    #[test]
+    fn jsx_highlighting_works() {
+        let source = "const App = () => <div>hello</div>;";
+        let mut hl = TreeSitter::new();
+        let result = hl.highlight(source, Path::new("app.jsx")).unwrap();
+        assert!(!result.is_empty());
+    }
+
+    #[test]
+    fn tsx_highlighting_works() {
+        let source = "const App: React.FC = () => <div>hello</div>;";
+        let mut hl = TreeSitter::new();
+        let result = hl.highlight(source, Path::new("app.tsx")).unwrap();
+        assert!(!result.is_empty());
+    }
+
+    #[test]
+    fn toml_highlighting_works() {
+        let source = "[package]\nname = \"test\"";
+        let mut hl = TreeSitter::new();
+        let result = hl.highlight(source, Path::new("Cargo.toml")).unwrap();
+        let has_string = result
+            .iter()
+            .flat_map(|l| &l.spans)
+            .any(|s| s.kind == codepeek_core::HighlightKind::String);
+        assert!(has_string, "expected string highlight in TOML");
+    }
+
+    #[test]
+    fn json_highlighting_works() {
+        let source = r#"{"key": "value"}"#;
+        let mut hl = TreeSitter::new();
+        let result = hl.highlight(source, Path::new("data.json")).unwrap();
+        assert!(!result.is_empty());
+    }
+
+    #[test]
+    fn default_creates_same_as_new() {
+        let a = TreeSitter::new();
+        let b = TreeSitter::default();
+        let source = "fn x() {}";
+        let mut hl_a = a;
+        let mut hl_b = b;
+        let r_a = hl_a.highlight(source, Path::new("t.rs")).unwrap();
+        let r_b = hl_b.highlight(source, Path::new("t.rs")).unwrap();
+        assert_eq!(r_a.len(), r_b.len());
+    }
+
+    #[test]
+    fn noop_handles_single_line_no_newline() {
+        let mut hl = Noop;
+        let result = hl.highlight("single", Path::new("test.rs")).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].content, "single");
     }
 
     #[test]

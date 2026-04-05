@@ -1,6 +1,5 @@
 use std::path::Path;
 
-/// Detect tree-sitter language name from file extension.
 pub fn detect_language(path: &Path) -> Option<&'static str> {
     let ext = path.extension()?.to_str()?;
     match ext {
@@ -23,18 +22,6 @@ pub fn detect_language(path: &Path) -> Option<&'static str> {
         "css" => Some("css"),
         "sh" | "bash" => Some("bash"),
         "lua" => Some("lua"),
-        "zig" => Some("zig"),
-        "swift" => Some("swift"),
-        "kt" | "kts" => Some("kotlin"),
-        "scala" => Some("scala"),
-        "ex" | "exs" => Some("elixir"),
-        "erl" | "hrl" => Some("erlang"),
-        "hs" => Some("haskell"),
-        "ml" | "mli" => Some("ocaml"),
-        "r" | "R" => Some("r"),
-        "sql" => Some("sql"),
-        "tf" | "hcl" => Some("hcl"),
-        "Dockerfile" => Some("dockerfile"),
         _ => None,
     }
 }
@@ -103,5 +90,79 @@ mod tests {
         assert_eq!(detect_language(Path::new("config.yaml")), Some("yaml"));
         assert_eq!(detect_language(Path::new("config.yml")), Some("yaml"));
         assert_eq!(detect_language(Path::new("data.json")), Some("json"));
+    }
+
+    #[test]
+    fn jsx_extension() {
+        assert_eq!(detect_language(Path::new("component.jsx")), Some("jsx"));
+    }
+
+    #[test]
+    fn go_extension() {
+        assert_eq!(detect_language(Path::new("main.go")), Some("go"));
+    }
+
+    #[test]
+    fn c_extensions() {
+        assert_eq!(detect_language(Path::new("main.c")), Some("c"));
+        assert_eq!(detect_language(Path::new("header.h")), Some("c"));
+    }
+
+    #[test]
+    fn java_extension() {
+        assert_eq!(detect_language(Path::new("Main.java")), Some("java"));
+    }
+
+    #[test]
+    fn ruby_extension() {
+        assert_eq!(detect_language(Path::new("app.rb")), Some("ruby"));
+    }
+
+    #[test]
+    fn markup_extensions() {
+        assert_eq!(detect_language(Path::new("page.html")), Some("html"));
+        assert_eq!(detect_language(Path::new("page.htm")), Some("html"));
+        assert_eq!(detect_language(Path::new("style.css")), Some("css"));
+        assert_eq!(detect_language(Path::new("readme.md")), Some("markdown"));
+        assert_eq!(
+            detect_language(Path::new("readme.markdown")),
+            Some("markdown")
+        );
+    }
+
+    #[test]
+    fn lua_extension() {
+        assert_eq!(detect_language(Path::new("init.lua")), Some("lua"));
+    }
+
+    #[test]
+    fn unsupported_languages_return_none() {
+        assert_eq!(detect_language(Path::new("main.zig")), None);
+        assert_eq!(detect_language(Path::new("main.swift")), None);
+        assert_eq!(detect_language(Path::new("main.kt")), None);
+        assert_eq!(detect_language(Path::new("main.scala")), None);
+        assert_eq!(detect_language(Path::new("main.ex")), None);
+    }
+
+    #[test]
+    fn mts_and_cts_extensions() {
+        assert_eq!(detect_language(Path::new("module.mts")), Some("typescript"));
+        assert_eq!(detect_language(Path::new("module.cts")), Some("typescript"));
+    }
+
+    #[test]
+    fn tsx_extension() {
+        assert_eq!(detect_language(Path::new("component.tsx")), Some("tsx"));
+    }
+
+    #[test]
+    fn pyi_extension() {
+        assert_eq!(detect_language(Path::new("stubs.pyi")), Some("python"));
+    }
+
+    #[test]
+    fn cpp_cxx_and_hxx_extensions() {
+        assert_eq!(detect_language(Path::new("main.cxx")), Some("cpp"));
+        assert_eq!(detect_language(Path::new("header.hxx")), Some("cpp"));
     }
 }

@@ -12,9 +12,13 @@ This is a Cargo workspace monorepo organized into apps and crates:
 apps/
   tui/          -> Terminal user interface (the main binary)
 crates/
-  core/         -> Domain logic and shared types
+  core/         -> Domain logic, shared types, and trait definitions
+  git/          -> Git-based change detection and diff computation (git2)
+  syntax/       -> Tree-sitter syntax highlighting (17 language grammars)
   view/         -> Presentation layer and UI components (ratatui)
 ```
+
+Dependency direction: `apps/tui` -> `codepeek-view` -> `codepeek-core`, `codepeek-git` -> `codepeek-core`, `codepeek-syntax` -> `codepeek-core`.
 
 ## Usage
 

@@ -17,7 +17,6 @@ use crate::theme;
 
 const TICK_RATE: Duration = Duration::from_millis(16);
 
-/// Which component currently has keyboard focus.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Focus {
     FileList,
@@ -31,9 +30,7 @@ pub struct App {
     file_viewer: FileViewer,
     change_detector: Box<dyn ChangeDetector>,
     highlighter: Box<dyn SyntaxHighlighter>,
-    /// Floating overlay showing HEAD content of a deleted file.
     peek_overlay: Option<PeekOverlay>,
-    /// Transient error message shown in the status bar area.
     error_message: Option<String>,
 }
 
@@ -66,13 +63,11 @@ impl App {
     fn render(&self, frame: &mut Frame) {
         let area = frame.area();
 
-        // Reserve the bottom row for the status bar.
         let [main_area, status_area] =
             Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(area);
 
         match self.focus {
             Focus::FileList => {
-                // File list fills the entire main area.
                 self.file_list.render(frame, main_area);
                 StatusBar::render(
                     &[
@@ -86,7 +81,6 @@ impl App {
                 );
             }
             Focus::FileViewer => {
-                // Two-panel layout: file list (30%) | file viewer (70%).
                 let [left, right] =
                     Layout::horizontal([Constraint::Percentage(30), Constraint::Percentage(70)])
                         .areas(main_area);
@@ -106,7 +100,6 @@ impl App {
             }
         }
 
-        // Overlay error message on the status bar if present.
         if let Some(msg) = &self.error_message {
             let error_line = Line::from(vec![
                 Span::styled(" ERROR ", Style::default().fg(Color::White).bg(Color::Red)),
@@ -115,7 +108,6 @@ impl App {
             frame.render_widget(Paragraph::new(error_line), status_area);
         }
 
-        // Render peek overlay on top of everything when visible.
         if let Some(overlay) = &self.peek_overlay {
             overlay.render(frame, area);
         }
@@ -127,7 +119,6 @@ impl App {
                 if let Event::Key(key) = event::read()?
                     && key.kind == KeyEventKind::Press
                 {
-                    // Clear any transient error message on the next keypress.
                     self.error_message = None;
 
                     let action = if let Some(overlay) = &mut self.peek_overlay {
@@ -160,11 +151,7 @@ impl App {
             Action::DismissPeek => {
                 self.peek_overlay = None;
             }
-            Action::ToggleDiff
-            | Action::Noop
-            | Action::ScrollUp(_)
-            | Action::ScrollDown(_)
-            | Action::PeekDeleted(_) => {}
+            Action::ToggleDiff | Action::Noop => {}
         }
     }
 
@@ -177,16 +164,14 @@ impl App {
         let path = file.path.clone();
         let kind = file.kind.clone();
 
-        // For deleted files, show a peek overlay with HEAD content.
         if kind == ChangeKind::Deleted {
             self.open_deleted_peek(&path);
             return;
         }
 
-        // Read raw bytes first for binary detection.
         match std::fs::read(&path) {
             Ok(bytes) => {
-                // Binary heuristic: null byte in the first 8KB.
+                // Binary heuristic: null byte in the first 8 KiB.
                 let check_len = bytes.len().min(8192);
                 if bytes[..check_len].contains(&0) {
                     self.file_viewer
@@ -205,9 +190,7 @@ impl App {
         self.focus = Focus::FileViewer;
     }
 
-    /// Open a file with syntax highlighting and diff information.
     fn open_with_highlighting(&mut self, path: &std::path::Path, content: &str, kind: &ChangeKind) {
-        // Attempt syntax highlighting.
         let highlighted = match self.highlighter.highlight(content, path) {
             Ok(lines) => lines,
             Err(_) => {
@@ -222,11 +205,11 @@ impl App {
             }
         };
 
-        // Compute diff hunks and build change map.
         let hunks = self.change_detector.compute_diff(path).unwrap_or_default();
         let mut change_map = ChangeMap::from_hunks(&hunks);
 
-        // For newly added files, mark all lines as added.
+        // For added files, mark every line as added since git has no prior version.
+
         if *kind == ChangeKind::Added {
             #[allow(clippy::cast_possible_truncation)]
             let line_count = highlighted.len() as u32;
@@ -239,7 +222,6 @@ impl App {
             .load_highlighted(path.to_path_buf(), highlighted, change_map, hunks);
     }
 
-    /// Open a peek overlay for a deleted file, reading content from HEAD.
     fn open_deleted_peek(&mut self, path: &std::path::Path) {
         match self.change_detector.read_at_head(path) {
             Ok(content) => {
@@ -289,7 +271,6 @@ mod tests {
 
     use super::*;
 
-    /// Stub change detector that returns a fixed list of files.
     struct StubDetector {
         files: Vec<FileChange>,
     }
@@ -318,7 +299,6 @@ mod tests {
         }
     }
 
-    /// Stub highlighter.
     struct StubHighlighter;
 
     impl SyntaxHighlighter for StubHighlighter {
@@ -421,7 +401,6 @@ mod tests {
         )
         .unwrap();
 
-        // Simulate opening a file by loading content directly.
         app.file_viewer
             .load(PathBuf::from("test.rs"), "fn main() {}\n");
         app.focus = Focus::FileViewer;
@@ -450,12 +429,10 @@ mod tests {
 
         assert_eq!(app.file_list.files().len(), 2);
         app.dispatch(&Action::Refresh);
-        // StubDetector always returns the same files, so list is refreshed with same data.
         assert_eq!(app.file_list.files().len(), 2);
         assert!(app.error_message.is_none());
     }
 
-    /// Stub detector that always fails.
     struct FailingDetector;
 
     impl ChangeDetector for FailingDetector {
@@ -483,7 +460,6 @@ mod tests {
         )
         .unwrap();
 
-        // Replace the change_detector with a failing one.
         app.change_detector = Box::new(FailingDetector);
         app.dispatch(&Action::Refresh);
 
@@ -589,7 +565,6 @@ mod tests {
         )
         .unwrap();
 
-        // Manually set a peek overlay.
         app.peek_overlay = Some(PeekOverlay::new(
             PathBuf::from("deleted.rs"),
             vec![HighlightedLine {
@@ -635,7 +610,6 @@ mod tests {
         );
     }
 
-    /// Stub detector that provides HEAD content for deleted files.
     struct StubDetectorWithHead {
         files: Vec<FileChange>,
         head_content: String,

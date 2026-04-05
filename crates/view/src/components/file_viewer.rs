@@ -10,13 +10,14 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use codepeek_core::{ChangeMap, DiffHunk, DiffLine, HighlightSpan, HighlightedLine, LineChange};
 
 use crate::action::Action;
+use crate::render_helpers::{
+    build_highlighted_spans_owned, dim_line_number, line_number_width, truncate_line,
+};
 use crate::theme;
 use crate::theme::GutterMark;
 
-/// Lines longer than this are truncated with an ellipsis during rendering.
 const MAX_LINE_LENGTH: usize = 500;
 
-/// Pre-computed display data for a single viewer line.
 struct ViewerLine {
     line_number: String,
     content: String,
@@ -24,8 +25,6 @@ struct ViewerLine {
     gutter_mark: GutterMark,
 }
 
-/// Component that displays file content with syntax highlighting,
-/// gutter marks, and optional diff view.
 pub struct FileViewer {
     display_lines: Vec<ViewerLine>,
     scroll_offset: usize,
@@ -47,7 +46,6 @@ impl FileViewer {
         }
     }
 
-    /// Load highlighted file content with change information.
     pub fn load_highlighted(
         &mut self,
         path: PathBuf,
@@ -86,7 +84,6 @@ impl FileViewer {
         self.show_diff = false;
     }
 
-    /// Load plain text content (fallback when highlighting fails or for messages).
     pub fn load(&mut self, path: PathBuf, content: &str) {
         let lines: Vec<HighlightedLine> = content
             .lines()
@@ -96,17 +93,6 @@ impl FileViewer {
             })
             .collect();
         self.load_highlighted(path, lines, ChangeMap::default(), Vec::new());
-    }
-
-    /// Clear the viewer content.
-    #[allow(dead_code)]
-    pub fn clear(&mut self) {
-        self.display_lines.clear();
-        self.scroll_offset = 0;
-        self.file_path = None;
-        self.change_map = ChangeMap::default();
-        self.diff_hunks = Vec::new();
-        self.show_diff = false;
     }
 
     pub fn handle_event(&mut self, key: KeyEvent) -> Action {
@@ -143,7 +129,6 @@ impl FileViewer {
         }
     }
 
-    /// Total number of renderable lines (including interleaved diff lines).
     fn total_visible_lines(&self) -> usize {
         if self.show_diff {
             self.build_diff_lines().len()
@@ -191,9 +176,7 @@ impl FileViewer {
         frame.render_widget(paragraph, area);
     }
 
-    /// Build all lines for diff view, interleaving removed lines from hunks.
     fn build_diff_lines(&self) -> Vec<Line<'_>> {
-        // Build a map of new_lineno -> removed lines that come before it.
         let mut removed_before: std::collections::BTreeMap<u32, Vec<&DiffLine>> =
             std::collections::BTreeMap::new();
 
@@ -219,7 +202,6 @@ impl FileViewer {
                     }
                 }
             }
-            // Any remaining removed lines go after the last new line in the hunk.
             if !pending_removed.is_empty() {
                 let key = last_new_lineno.map_or(hunk.new_start, |n| n + 1);
                 removed_before
@@ -235,23 +217,23 @@ impl FileViewer {
             #[allow(clippy::cast_possible_truncation)]
             let line_num = (i + 1) as u32;
 
-            // Insert any removed lines before this line.
             if let Some(removed) = removed_before.get(&line_num) {
                 for dl in removed {
-                    let mut spans = vec![Span::styled("   - ", theme::diff_removed_style())];
-                    let content = truncate_line(&dl.content);
-                    spans.push(Span::styled(content, theme::diff_removed_style()));
+                    let content = truncate_line(&dl.content, MAX_LINE_LENGTH);
+                    let spans = vec![
+                        Span::styled("   - ", theme::diff_removed_style()),
+                        Span::styled(content, theme::diff_removed_style()),
+                    ];
                     result.push(Line::from(spans));
                 }
             }
 
-            // Render the current line with diff styling if it's added/modified.
             if self.change_map.added.contains(&line_num)
                 || self.change_map.modified.contains(&line_num)
             {
                 let gutter_mark_text = theme::gutter_text(&vl.gutter_mark);
                 let gutter_mark_style = theme::gutter_style(&vl.gutter_mark);
-                let content = truncate_line(&vl.content);
+                let content = truncate_line(&vl.content, MAX_LINE_LENGTH);
                 let spans = vec![
                     Span::styled(format!("{} ", vl.line_number), theme::diff_added_style()),
                     Span::styled(gutter_mark_text, gutter_mark_style),
@@ -263,15 +245,16 @@ impl FileViewer {
             }
         }
 
-        // Handle any removed lines that come after the last source line.
         #[allow(clippy::cast_possible_truncation)]
         let after_last = (self.display_lines.len() as u32) + 1;
         for (&key, removed) in &removed_before {
             if key >= after_last {
                 for dl in removed {
-                    let mut spans = vec![Span::styled("   - ", theme::diff_removed_style())];
-                    let content = truncate_line(&dl.content);
-                    spans.push(Span::styled(content, theme::diff_removed_style()));
+                    let content = truncate_line(&dl.content, MAX_LINE_LENGTH);
+                    let spans = vec![
+                        Span::styled("   - ", theme::diff_removed_style()),
+                        Span::styled(content, theme::diff_removed_style()),
+                    ];
                     result.push(Line::from(spans));
                 }
             }
@@ -280,86 +263,26 @@ impl FileViewer {
         result
     }
 
-    /// Returns true if the viewer has content loaded.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn is_loaded(&self) -> bool {
         !self.display_lines.is_empty()
     }
 }
 
-/// Render a single viewer line with line number, gutter mark, and highlighted content.
 fn render_viewer_line(vl: &ViewerLine) -> Line<'_> {
     let gutter_mark_text = theme::gutter_text(&vl.gutter_mark);
     let gutter_mark_style = theme::gutter_style(&vl.gutter_mark);
 
     let mut spans = vec![
-        Span::styled(
-            format!("{} ", vl.line_number),
-            Style::default().fg(theme::DIM_COLOR),
-        ),
+        dim_line_number(&vl.line_number),
         Span::styled(gutter_mark_text, gutter_mark_style),
     ];
-    spans.extend(build_highlighted_spans(&vl.content, &vl.spans));
+    spans.extend(build_highlighted_spans_owned(
+        &vl.content,
+        &vl.spans,
+        MAX_LINE_LENGTH,
+    ));
     Line::from(spans)
-}
-
-/// Build ratatui `Span`s from highlighted line content and its `HighlightSpan`s.
-fn build_highlighted_spans<'a>(content: &'a str, spans: &[HighlightSpan]) -> Vec<Span<'a>> {
-    let truncated;
-    let display_content = if content.len() > MAX_LINE_LENGTH {
-        truncated = format!("{}\u{2026}", &content[..MAX_LINE_LENGTH]);
-        &truncated
-    } else {
-        content
-    };
-
-    if spans.is_empty() {
-        return vec![Span::raw(display_content.to_string())];
-    }
-
-    let mut result = Vec::new();
-    let mut cursor = 0;
-
-    for hs in spans {
-        let start = hs.start.min(display_content.len());
-        let end = hs.end.min(display_content.len());
-        if start > cursor {
-            result.push(Span::raw(display_content[cursor..start].to_string()));
-        }
-        if start < end {
-            result.push(Span::styled(
-                display_content[start..end].to_string(),
-                theme::highlight_style(hs.kind),
-            ));
-        }
-        cursor = end;
-    }
-
-    if cursor < display_content.len() {
-        result.push(Span::raw(display_content[cursor..].to_string()));
-    }
-
-    result
-}
-
-/// Truncate a line to `MAX_LINE_LENGTH`, appending ellipsis if needed.
-fn truncate_line(content: &str) -> String {
-    if content.len() > MAX_LINE_LENGTH {
-        let mut truncated = content[..MAX_LINE_LENGTH].to_string();
-        truncated.push('\u{2026}');
-        truncated
-    } else {
-        content.to_string()
-    }
-}
-
-/// Calculate the width needed for line numbers.
-fn line_number_width(total_lines: usize) -> usize {
-    if total_lines == 0 {
-        1
-    } else {
-        total_lines.ilog10() as usize + 1
-    }
 }
 
 #[cfg(test)]
@@ -456,26 +379,16 @@ mod tests {
     }
 
     #[test]
-    fn clear_resets_state() {
-        let mut viewer = FileViewer::new();
-        viewer.load(PathBuf::from("test.rs"), "content");
-        assert!(viewer.is_loaded());
-
-        viewer.clear();
+    fn is_loaded_false_when_empty() {
+        let viewer = FileViewer::new();
         assert!(!viewer.is_loaded());
-        assert!(viewer.file_path.is_none());
     }
 
     #[test]
-    fn line_number_width_for_various_sizes() {
-        assert_eq!(line_number_width(0), 1);
-        assert_eq!(line_number_width(1), 1);
-        assert_eq!(line_number_width(9), 1);
-        assert_eq!(line_number_width(10), 2);
-        assert_eq!(line_number_width(99), 2);
-        assert_eq!(line_number_width(100), 3);
-        assert_eq!(line_number_width(999), 3);
-        assert_eq!(line_number_width(1000), 4);
+    fn is_loaded_true_when_content() {
+        let mut viewer = FileViewer::new();
+        viewer.load(PathBuf::from("test.rs"), "content");
+        assert!(viewer.is_loaded());
     }
 
     #[test]
@@ -522,7 +435,6 @@ mod tests {
             .map(ratatui::buffer::Cell::symbol)
             .collect();
 
-        // The original data should not contain 600 x's, it should be truncated.
         let x_count = content.matches('x').count();
         assert!(
             x_count <= MAX_LINE_LENGTH,
@@ -669,7 +581,6 @@ mod tests {
             .map(ratatui::buffer::Cell::symbol)
             .collect();
 
-        // Gutter marks use thin vertical bars for added/modified.
         assert!(
             content.contains('\u{258e}'),
             "should show gutter mark for changed lines"
@@ -718,7 +629,6 @@ mod tests {
         let mut viewer = FileViewer::new();
         viewer.load_highlighted(PathBuf::from("test.rs"), lines, change_map, hunks);
 
-        // Toggle diff on.
         viewer.handle_event(make_key(KeyCode::Char('d')));
         assert!(viewer.show_diff);
 
@@ -743,5 +653,61 @@ mod tests {
             content.contains("new line two"),
             "diff view should show added lines"
         );
+    }
+
+    #[test]
+    fn page_up_and_down() {
+        let mut viewer = FileViewer::new();
+        let content: String = (0..50)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        viewer.load(PathBuf::from("test.rs"), &content);
+
+        viewer.handle_event(make_key(KeyCode::PageDown));
+        assert_eq!(viewer.scroll_offset, 20);
+
+        viewer.handle_event(make_key(KeyCode::PageUp));
+        assert_eq!(viewer.scroll_offset, 0);
+    }
+
+    #[test]
+    fn k_and_j_keys_scroll() {
+        let mut viewer = FileViewer::new();
+        viewer.load(PathBuf::from("test.rs"), "a\nb\nc\nd\ne");
+
+        viewer.handle_event(make_key(KeyCode::Char('j')));
+        assert_eq!(viewer.scroll_offset, 1);
+
+        viewer.handle_event(make_key(KeyCode::Char('k')));
+        assert_eq!(viewer.scroll_offset, 0);
+    }
+
+    #[test]
+    fn unknown_key_returns_noop() {
+        let mut viewer = FileViewer::new();
+        let action = viewer.handle_event(make_key(KeyCode::Char('x')));
+        assert_eq!(action, Action::Noop);
+    }
+
+    #[test]
+    fn diff_indicator_in_title() {
+        let mut viewer = FileViewer::new();
+        viewer.load(PathBuf::from("test.rs"), "content");
+        viewer.show_diff = true;
+
+        let backend = TestBackend::new(60, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| viewer.render(frame, frame.area()))
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let content: String = buffer
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(content.contains("[DIFF]"), "should show DIFF indicator");
     }
 }

@@ -1,9 +1,5 @@
 use codepeek_core::HighlightKind;
 
-/// Map a tree-sitter highlight capture name to a `HighlightKind`.
-///
-/// Tree-sitter capture names can be hierarchical (e.g., `"function.builtin"`).
-/// Exact matches are tried first, then prefix matching for broader coverage.
 pub fn map_highlight(name: &str) -> Option<HighlightKind> {
     match name {
         "keyword"

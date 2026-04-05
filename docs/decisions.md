@@ -16,3 +16,10 @@
 - 2026-04-03: MIT license
 - 2026-04-04: `docs/decisions.md` tracks all project decisions as a flat timestamped list
 - 2026-04-04: `docs/plans/` holds implementation plans, one file per feature, named `<timestamp>--<feature-name>.md`
+- 2026-04-05: `codepeek-core` traits: `ChangeDetector` is `Send + Sync` with `&self`; `SyntaxHighlighter` is `Send + Sync` with `&mut self` (tree-sitter requires mutation)
+- 2026-04-05: `thiserror` for all library crate errors, `color-eyre` only in the binary — error enums scoped per domain, no ball-of-mud catch-all
+- 2026-04-05: `detect_language` in codepeek-syntax only returns languages with bundled tree-sitter grammars — no aspirational entries for unsupported languages
+- 2026-04-05: Individual tree-sitter grammar crates (not language-pack) because they bundle `.scm` highlight queries at compile time
+- 2026-04-05: Shared rendering helpers (`build_highlighted_spans`, `line_number_width`, `truncate_line`) extracted to `crates/view/src/render_helpers.rs` to avoid duplication between components
+- 2026-04-05: Test-only methods on private components use `#[cfg(test)]` instead of `#[allow(dead_code)]`
+- 2026-04-05: git2 status API does not detect renames without `find_similar()` — staged rename appears as delete+add pair

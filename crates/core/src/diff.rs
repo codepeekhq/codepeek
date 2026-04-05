@@ -1,6 +1,5 @@
 use std::collections::HashSet;
 
-/// The kind of change on a single line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LineChange {
     Added,
@@ -8,7 +7,6 @@ pub enum LineChange {
     Modified,
 }
 
-/// A single line in a diff hunk.
 #[derive(Debug, Clone)]
 pub struct DiffLine {
     pub kind: LineChange,
@@ -17,7 +15,6 @@ pub struct DiffLine {
     pub new_lineno: Option<u32>,
 }
 
-/// A contiguous region of changes.
 #[derive(Debug, Clone)]
 pub struct DiffHunk {
     pub old_start: u32,
@@ -27,7 +24,6 @@ pub struct DiffHunk {
     pub lines: Vec<DiffLine>,
 }
 
-/// Line-level change information optimized for per-line gutter lookup.
 #[derive(Debug, Clone, Default)]
 pub struct ChangeMap {
     pub added: HashSet<u32>,
@@ -36,7 +32,6 @@ pub struct ChangeMap {
 }
 
 impl ChangeMap {
-    /// Build a `ChangeMap` from a set of diff hunks.
     pub fn from_hunks(hunks: &[DiffHunk]) -> Self {
         let mut map = Self::default();
         for hunk in hunks {

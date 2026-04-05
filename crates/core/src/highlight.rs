@@ -1,6 +1,5 @@
 use std::fmt;
 
-/// Categories of syntax elements for highlighting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum HighlightKind {
     Keyword,
@@ -39,7 +38,6 @@ impl fmt::Display for HighlightKind {
     }
 }
 
-/// A span within a single line that has a specific highlight kind.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HighlightSpan {
     pub start: usize,
@@ -47,9 +45,95 @@ pub struct HighlightSpan {
     pub kind: HighlightKind,
 }
 
-/// A single line of source code with its highlight spans.
 #[derive(Debug, Clone)]
 pub struct HighlightedLine {
     pub content: String,
     pub spans: Vec<HighlightSpan>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn display_all_highlight_kinds() {
+        assert_eq!(HighlightKind::Keyword.to_string(), "keyword");
+        assert_eq!(HighlightKind::Function.to_string(), "function");
+        assert_eq!(HighlightKind::Type.to_string(), "type");
+        assert_eq!(HighlightKind::String.to_string(), "string");
+        assert_eq!(HighlightKind::Comment.to_string(), "comment");
+        assert_eq!(HighlightKind::Number.to_string(), "number");
+        assert_eq!(HighlightKind::Operator.to_string(), "operator");
+        assert_eq!(HighlightKind::Variable.to_string(), "variable");
+        assert_eq!(HighlightKind::Punctuation.to_string(), "punctuation");
+        assert_eq!(HighlightKind::Constant.to_string(), "constant");
+        assert_eq!(HighlightKind::Property.to_string(), "property");
+        assert_eq!(HighlightKind::Tag.to_string(), "tag");
+        assert_eq!(HighlightKind::Attribute.to_string(), "attribute");
+    }
+
+    #[test]
+    fn highlight_kind_equality_and_hash() {
+        use std::collections::HashSet;
+        let mut set = HashSet::new();
+        set.insert(HighlightKind::Keyword);
+        set.insert(HighlightKind::Keyword);
+        assert_eq!(set.len(), 1);
+        set.insert(HighlightKind::Function);
+        assert_eq!(set.len(), 2);
+    }
+
+    #[test]
+    fn highlight_span_equality() {
+        let a = HighlightSpan {
+            start: 0,
+            end: 5,
+            kind: HighlightKind::Keyword,
+        };
+        let b = HighlightSpan {
+            start: 0,
+            end: 5,
+            kind: HighlightKind::Keyword,
+        };
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn highlight_span_inequality_on_kind() {
+        let a = HighlightSpan {
+            start: 0,
+            end: 5,
+            kind: HighlightKind::Keyword,
+        };
+        let b = HighlightSpan {
+            start: 0,
+            end: 5,
+            kind: HighlightKind::Function,
+        };
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn highlighted_line_with_no_spans() {
+        let line = HighlightedLine {
+            content: "plain text".to_string(),
+            spans: vec![],
+        };
+        assert_eq!(line.content, "plain text");
+        assert!(line.spans.is_empty());
+    }
+
+    #[test]
+    fn highlighted_line_with_spans() {
+        let line = HighlightedLine {
+            content: "fn main()".to_string(),
+            spans: vec![HighlightSpan {
+                start: 0,
+                end: 2,
+                kind: HighlightKind::Keyword,
+            }],
+        };
+        assert_eq!(line.spans.len(), 1);
+        assert_eq!(line.spans[0].kind, HighlightKind::Keyword);
+    }
 }

@@ -4,7 +4,6 @@ pub mod error;
 pub mod highlight;
 pub mod traits;
 
-// Facade re-exports for convenient access
 pub use change::{ChangeKind, FileChange};
 pub use diff::{ChangeMap, DiffHunk, DiffLine, LineChange};
 pub use error::{ChangeError, SyntaxError};

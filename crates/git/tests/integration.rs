@@ -224,3 +224,88 @@ fn read_at_head_missing_file_errors() {
 
     assert!(result.is_err());
 }
+
+// git2 status doesn't detect renames without find_similar() on the diff.
+// Staging a remove+add shows as Deleted+Added, not Renamed. This test
+// verifies the current behavior: rename appears as a delete + add pair.
+#[test]
+fn rename_via_stage_shows_as_delete_and_add() {
+    let dir = tempdir().expect("failed to create tempdir");
+    let repo = init_repo_with_commit(dir.path());
+
+    let old_path = dir.path().join("hello.txt");
+    let new_path = dir.path().join("greeting.txt");
+    fs::rename(&old_path, &new_path).expect("failed to rename file");
+
+    let mut index = repo.index().expect("failed to get index");
+    index
+        .remove_path(Path::new("hello.txt"))
+        .expect("failed to remove old path");
+    index
+        .add_path(Path::new("greeting.txt"))
+        .expect("failed to add new path");
+    index.write().expect("failed to write index");
+
+    let detector = GitChangeDetector::open(dir.path()).expect("failed to open detector");
+    let changes = detector.detect_changes().expect("failed to detect changes");
+
+    assert_eq!(changes.len(), 2, "expected delete + add, got: {changes:?}");
+    let has_deleted = changes.iter().any(|c| c.kind == ChangeKind::Deleted);
+    let has_added = changes.iter().any(|c| c.kind == ChangeKind::Added);
+    assert!(has_deleted, "expected a deleted entry for the old file");
+    assert!(has_added, "expected an added entry for the new file");
+}
+
+#[test]
+fn diff_for_added_file() {
+    let dir = tempdir().expect("failed to create tempdir");
+    let repo = init_repo_with_commit(dir.path());
+
+    fs::write(dir.path().join("brand_new.txt"), "new content\n").expect("failed to write");
+
+    let mut index = repo.index().expect("failed to get index");
+    index
+        .add_path(Path::new("brand_new.txt"))
+        .expect("failed to add");
+    index.write().expect("failed to write index");
+
+    let detector = GitChangeDetector::open(dir.path()).expect("failed to open detector");
+    let hunks = detector
+        .compute_diff(Path::new("brand_new.txt"))
+        .expect("failed to compute diff");
+
+    assert!(
+        !hunks.is_empty(),
+        "expected at least one hunk for added file"
+    );
+    let has_added = hunks
+        .iter()
+        .flat_map(|h| &h.lines)
+        .any(|l| l.kind == codepeek_core::LineChange::Added);
+    assert!(has_added, "expected added lines in diff");
+}
+
+#[test]
+fn multiple_changes_sorted_by_mtime() {
+    let dir = tempdir().expect("failed to create tempdir");
+    init_repo_with_commit(dir.path());
+
+    fs::write(dir.path().join("first.txt"), "first").expect("failed to write");
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    fs::write(dir.path().join("second.txt"), "second").expect("failed to write");
+
+    let detector = GitChangeDetector::open(dir.path()).expect("failed to open detector");
+    let changes = detector.detect_changes().expect("failed to detect changes");
+
+    assert!(changes.len() >= 2);
+    assert!(
+        changes[0].mtime >= changes[1].mtime,
+        "changes should be sorted by mtime descending"
+    );
+}
+
+#[test]
+fn open_nonexistent_repo_errors() {
+    let result = GitChangeDetector::open(Path::new("/nonexistent/path"));
+    assert!(result.is_err());
+}

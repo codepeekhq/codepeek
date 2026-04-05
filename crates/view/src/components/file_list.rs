@@ -9,10 +9,8 @@ use ratatui::widgets::{Block, Borders, List, ListItem, ListState};
 use crate::action::Action;
 use crate::theme;
 
-/// Component that displays a list of changed files.
 pub struct FileList {
     files: Vec<FileChange>,
-    /// Pre-computed display strings for each file (badge + path).
     display_items: Vec<(String, ChangeKind)>,
     selected: usize,
 }
@@ -106,12 +104,11 @@ impl FileList {
         frame.render_stateful_widget(list, area, &mut state);
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn selected_file(&self) -> Option<&FileChange> {
         self.files.get(self.selected)
     }
 
-    /// Replace the file list with a fresh set of changes, resetting selection.
     pub fn update_files(&mut self, files: Vec<FileChange>) {
         let display_items = files
             .iter()
@@ -135,7 +132,7 @@ impl FileList {
         &self.files
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.files.is_empty()
     }
@@ -307,5 +304,60 @@ mod tests {
         assert_eq!(list.selected, 0);
         assert_eq!(list.files().len(), 1);
         assert_eq!(list.files()[0].path, PathBuf::from("fresh.rs"));
+    }
+
+    #[test]
+    fn empty_list_q_still_quits() {
+        let mut list = FileList::new(vec![]);
+        let action = list.handle_event(make_key(KeyCode::Char('q')));
+        assert_eq!(action, Action::Quit);
+    }
+
+    #[test]
+    fn empty_list_other_keys_return_noop() {
+        let mut list = FileList::new(vec![]);
+        let action = list.handle_event(make_key(KeyCode::Enter));
+        assert_eq!(action, Action::Noop);
+    }
+
+    #[test]
+    fn k_moves_up() {
+        let mut list = FileList::new(sample_files());
+        list.handle_event(make_key(KeyCode::Down));
+        assert_eq!(list.selected, 1);
+        list.handle_event(make_key(KeyCode::Char('k')));
+        assert_eq!(list.selected, 0);
+    }
+
+    #[test]
+    fn j_moves_down() {
+        let mut list = FileList::new(sample_files());
+        list.handle_event(make_key(KeyCode::Char('j')));
+        assert_eq!(list.selected, 1);
+    }
+
+    #[test]
+    fn deleted_file_shows_with_badge() {
+        let files = vec![FileChange {
+            path: PathBuf::from("gone.rs"),
+            kind: ChangeKind::Deleted,
+            mtime: SystemTime::now(),
+        }];
+        let list = FileList::new(files);
+
+        let backend = TestBackend::new(40, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| list.render(frame, frame.area()))
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let content: String = buffer
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(content.contains('D'), "should show D badge for deleted");
+        assert!(content.contains("gone.rs"), "should show file path");
     }
 }

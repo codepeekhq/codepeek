@@ -6,13 +6,9 @@ use ratatui::widgets::Paragraph;
 
 use crate::theme;
 
-/// Stateless component that renders key binding hints in a status bar.
 pub struct StatusBar;
 
 impl StatusBar {
-    /// Render key hints at the given area.
-    ///
-    /// Each hint is a `(key, description)` pair, e.g. `("q", "quit")`.
     pub fn render(hints: &[(&str, &str)], frame: &mut Frame, area: Rect) {
         let spans: Vec<Span> = hints
             .iter()
@@ -71,5 +67,30 @@ mod tests {
                 StatusBar::render(&[], frame, frame.area());
             })
             .unwrap();
+    }
+
+    #[test]
+    fn renders_hint_text() {
+        let backend = TestBackend::new(60, 1);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                StatusBar::render(&[("q", "quit"), ("r", "refresh")], frame, frame.area());
+            })
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let content: String = buffer
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(content.contains('q'), "should show key");
+        assert!(content.contains("quit"), "should show description");
+        assert!(content.contains('r'), "should show second key");
+        assert!(
+            content.contains("refresh"),
+            "should show second description"
+        );
     }
 }
