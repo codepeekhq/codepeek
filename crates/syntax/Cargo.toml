@@ -1,0 +1,33 @@
+[package]
+name = "codepeek-syntax"
+version = "0.1.0"
+description = "Tree-sitter syntax highlighting for codepeek"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+codepeek-core.workspace = true
+tree-sitter.workspace = true
+tree-sitter-highlight.workspace = true
+tree-sitter-language.workspace = true
+tree-sitter-rust.workspace = true
+tree-sitter-python.workspace = true
+tree-sitter-javascript.workspace = true
+tree-sitter-typescript.workspace = true
+tree-sitter-go.workspace = true
+tree-sitter-c.workspace = true
+tree-sitter-cpp.workspace = true
+tree-sitter-java.workspace = true
+tree-sitter-ruby.workspace = true
+tree-sitter-toml-ng.workspace = true
+tree-sitter-json.workspace = true
+tree-sitter-bash.workspace = true
+tree-sitter-css.workspace = true
+tree-sitter-html.workspace = true
+tree-sitter-yaml.workspace = true
+tree-sitter-lua.workspace = true
+tree-sitter-md.workspace = true
+
+[lints]
+workspace = true

@@ -1,14 +1,14 @@
 [package]
-name = "codepeek-view"
+name = "codepeek-git"
 version = "0.1.0"
-description = "Presentation layer and UI components for codepeek"
+description = "Git-based change detection and diff computation for codepeek"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
 [dependencies]
 codepeek-core.workspace = true
-ratatui.workspace = true
+git2.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

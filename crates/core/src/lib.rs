@@ -1,3 +1,16 @@
+pub mod change;
+pub mod diff;
+pub mod error;
+pub mod highlight;
+pub mod traits;
+
+// Facade re-exports for convenient access
+pub use change::{ChangeKind, FileChange};
+pub use diff::{ChangeMap, DiffHunk, DiffLine, LineChange};
+pub use error::{ChangeError, SyntaxError};
+pub use highlight::{HighlightKind, HighlightSpan, HighlightedLine};
+pub use traits::{ChangeDetector, SyntaxHighlighter};
+
 pub const fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
