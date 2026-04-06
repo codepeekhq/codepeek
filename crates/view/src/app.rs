@@ -4,16 +4,15 @@ use std::time::Duration;
 use ratatui::DefaultTerminal;
 use ratatui::Frame;
 use ratatui::crossterm::event::{self, Event, KeyEventKind};
-use ratatui::layout::{Constraint, Layout, Margin};
-use ratatui::text::{Line, Span};
-use ratatui::widgets::Paragraph;
+use ratatui::layout::{Margin, Rect};
 
 use codepeek_core::{ChangeDetector, ChangeKind, ChangeMap, SyntaxHighlighter};
 
 use crate::action::Action;
-use crate::components::{FileList, FileViewer, PeekOverlay, StatusBar};
+use crate::components::{ErrorBar, FileList, FileViewer, PeekOverlay, StatusBar};
 use crate::config;
-use crate::theme;
+use crate::layout;
+use crate::theme::{self, Theme};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Focus {
@@ -59,75 +58,63 @@ impl App {
     }
 
     fn render(&self, frame: &mut Frame) {
-        let t = theme::current();
+        let theme = theme::current();
         let full = frame.area();
-        frame.render_widget(
-            ratatui::widgets::Block::default().style(ratatui::style::Style::new().bg(t.base_bg)),
-            full,
-        );
-
         let area = full.inner(Margin::new(config::OUTER_MARGIN, config::OUTER_MARGIN));
 
-        let [main_area, _gap, status_area] = Layout::vertical([
-            Constraint::Min(1),
-            Constraint::Length(1),
-            Constraint::Length(1),
-        ])
-        .areas(area);
-
         match self.focus {
-            Focus::FileList => {
-                self.file_list.render(frame, main_area);
-                StatusBar::render(
-                    &[
-                        ("\u{2191}\u{2193}", "navigate"),
-                        ("\u{23ce}", "open"),
-                        ("r", "refresh"),
-                        ("q", "quit"),
-                    ],
-                    frame,
-                    status_area,
-                );
-            }
-            Focus::FileViewer => {
-                let [left, _gap, right] = Layout::horizontal([
-                    Constraint::Percentage(config::FILE_LIST_WIDTH_PERCENT),
-                    Constraint::Length(config::PANEL_GAP),
-                    Constraint::Percentage(config::FILE_VIEWER_WIDTH_PERCENT),
-                ])
-                .areas(main_area);
-
-                self.file_list.render_with_focus(frame, left, false);
-                self.file_viewer.render(frame, right);
-                StatusBar::render(
-                    &[
-                        ("\u{2191}\u{2193}", "scroll"),
-                        ("d", "diff"),
-                        ("esc", "back"),
-                        ("q", "quit"),
-                    ],
-                    frame,
-                    status_area,
-                );
-            }
-        }
-
-        if let Some(msg) = &self.error_message {
-            let error_line = Line::from(vec![
-                Span::styled(
-                    " ERROR ",
-                    ratatui::style::Style::new().fg(t.base_bg).bg(t.error_bg),
-                ),
-                Span::styled(
-                    format!(" {msg}"),
-                    ratatui::style::Style::new().fg(t.error_fg),
-                ),
-            ]);
-            frame.render_widget(Paragraph::new(error_line), status_area);
+            Focus::FileList => self.render_zen_file_list(frame, area, theme),
+            Focus::FileViewer => self.render_zen_viewer(frame, area, theme),
         }
 
         if let Some(overlay) = &self.peek_overlay {
-            overlay.render(frame, full);
+            overlay.render(frame, full, theme);
+        }
+    }
+
+    fn render_zen_file_list(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
+        let zen = layout::zen_file_list_layout(area);
+        self.file_list.render(frame, zen.content, theme);
+        self.render_status_or_error(
+            frame,
+            zen.status,
+            theme,
+            &[
+                ("\u{2191}\u{2193}", "navigate"),
+                ("\u{23ce}", "open"),
+                ("r", "refresh"),
+                ("q", "quit"),
+            ],
+        );
+    }
+
+    fn render_zen_viewer(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
+        let zen = layout::zen_viewer_layout(area);
+        self.file_viewer.render(frame, zen.content, theme);
+        self.render_status_or_error(
+            frame,
+            zen.status,
+            theme,
+            &[
+                ("\u{2191}\u{2193}", "scroll"),
+                ("d", "diff"),
+                ("esc", "back"),
+                ("q", "quit"),
+            ],
+        );
+    }
+
+    fn render_status_or_error(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        theme: &Theme,
+        hints: &[(&str, &str)],
+    ) {
+        if let Some(msg) = &self.error_message {
+            ErrorBar::render(msg, frame, area, theme);
+        } else {
+            StatusBar::render(hints, frame, area, theme);
         }
     }
 
@@ -406,7 +393,7 @@ mod tests {
     }
 
     #[test]
-    fn viewer_layout_renders_both_panels() {
+    fn viewer_layout_shows_file_content() {
         let mut app = App::new(
             Box::new(StubDetector::new(sample_files())),
             Box::new(StubHighlighter),
@@ -427,8 +414,14 @@ mod tests {
             .iter()
             .map(ratatui::buffer::Cell::symbol)
             .collect();
-        assert!(content.contains("Changes"), "should show file list");
-        assert!(content.contains("test.rs"), "should show file viewer");
+        assert!(
+            content.contains("test.rs"),
+            "zen viewer should show file name"
+        );
+        assert!(
+            !content.contains("Changes"),
+            "zen viewer should not show file list"
+        );
     }
 
     #[test]

@@ -1,42 +1,35 @@
 use ratatui::Frame;
-use ratatui::layout::Rect;
+use ratatui::layout::{Alignment, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use crate::theme;
+use crate::theme::Theme;
 
 pub struct StatusBar;
 
 impl StatusBar {
-    pub fn render(hints: &[(&str, &str)], frame: &mut Frame, area: Rect) {
-        let t = theme::current();
+    pub fn render(hints: &[(&str, &str)], frame: &mut Frame, area: Rect, theme: &Theme) {
+        let paragraph = Paragraph::new(Self::build_line(hints, theme)).alignment(Alignment::Center);
+        frame.render_widget(paragraph, area);
+    }
+
+    fn build_line<'a>(hints: &[(&str, &str)], theme: &Theme) -> Line<'a> {
         let spans: Vec<Span> = hints
             .iter()
             .enumerate()
             .flat_map(|(i, (key, desc))| {
                 let mut parts = vec![
-                    Span::styled(
-                        (*key).to_string(),
-                        ratatui::style::Style::new().fg(t.status_key),
-                    ),
-                    Span::styled(
-                        format!(" {desc}"),
-                        ratatui::style::Style::new().fg(t.status_desc),
-                    ),
+                    Span::styled((*key).to_string(), theme.ui.hint_key),
+                    Span::styled(format!(" {desc}"), theme.ui.hint_label),
                 ];
                 if i + 1 < hints.len() {
-                    parts.push(Span::styled(
-                        "   ",
-                        ratatui::style::Style::new().fg(t.status_separator),
-                    ));
+                    parts.push(Span::raw("   "));
                 }
                 parts
             })
             .collect();
 
-        let line = Line::from(spans);
-        let paragraph = Paragraph::new(line);
-        frame.render_widget(paragraph, area);
+        Line::from(spans)
     }
 }
 
@@ -46,6 +39,7 @@ mod tests {
     use ratatui::backend::TestBackend;
 
     use super::*;
+    use crate::theme;
 
     #[test]
     fn renders_without_panic() {
@@ -57,6 +51,7 @@ mod tests {
                     &[("q", "quit"), ("\u{2191}\u{2193}", "navigate")],
                     frame,
                     frame.area(),
+                    theme::current(),
                 );
             })
             .unwrap();
@@ -68,7 +63,7 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
             .draw(|frame| {
-                StatusBar::render(&[], frame, frame.area());
+                StatusBar::render(&[], frame, frame.area(), theme::current());
             })
             .unwrap();
     }
@@ -79,7 +74,12 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
             .draw(|frame| {
-                StatusBar::render(&[("q", "quit"), ("r", "refresh")], frame, frame.area());
+                StatusBar::render(
+                    &[("q", "quit"), ("r", "refresh")],
+                    frame,
+                    frame.area(),
+                    theme::current(),
+                );
             })
             .unwrap();
 

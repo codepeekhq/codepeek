@@ -14,8 +14,7 @@ use crate::keybindings;
 use crate::render_helpers::{
     build_highlighted_spans_owned, dim_line_number, line_number_width, truncate_line,
 };
-use crate::theme;
-use crate::theme::GutterMark;
+use crate::theme::{GutterMark, Theme};
 
 struct ViewerLine {
     line_number: String,
@@ -127,29 +126,33 @@ impl FileViewer {
 
     fn total_visible_lines(&self) -> usize {
         if self.show_diff {
-            self.build_diff_lines().len()
+            let removed_count: usize = self
+                .diff_hunks
+                .iter()
+                .flat_map(|h| h.lines.iter())
+                .filter(|dl| dl.kind == LineChange::Removed)
+                .count();
+            self.display_lines.len() + removed_count
         } else {
             self.display_lines.len()
         }
     }
 
-    pub fn render(&self, frame: &mut Frame, area: Rect) {
-        let t = theme::current();
+    pub fn render(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
         let title = self
             .file_path
             .as_ref()
             .map_or_else(|| " No file ".to_string(), |p| format!(" {} ", p.display()));
 
-        let mut title_spans = vec![Span::styled(title, ratatui::style::Style::new().fg(t.text))];
+        let mut title_spans = vec![Span::styled(title, theme.text.primary)];
 
         if self.show_diff {
-            title_spans.push(Span::styled(
-                " diff ",
-                ratatui::style::Style::new().fg(t.accent),
-            ));
+            title_spans.push(Span::styled(" diff ", theme.ui.accent));
         }
 
-        let block = theme::focused_block()
+        let block = theme
+            .border
+            .active_block()
             .title(Line::from(title_spans))
             .padding(Padding::new(1, 1, 0, 0));
 
@@ -157,7 +160,7 @@ impl FileViewer {
         let visible_height = inner.height as usize;
 
         let lines: Vec<Line> = if self.show_diff {
-            self.build_diff_lines()
+            self.build_diff_lines(theme)
                 .into_iter()
                 .skip(self.scroll_offset)
                 .take(visible_height)
@@ -167,7 +170,7 @@ impl FileViewer {
                 .iter()
                 .skip(self.scroll_offset)
                 .take(visible_height)
-                .map(|vl| render_viewer_line(vl))
+                .map(|vl| render_viewer_line(vl, theme))
                 .collect()
         };
 
@@ -175,7 +178,7 @@ impl FileViewer {
         frame.render_widget(paragraph, area);
     }
 
-    fn build_diff_lines(&self) -> Vec<Line<'_>> {
+    fn build_diff_lines(&self, theme: &Theme) -> Vec<Line<'_>> {
         let mut removed_before: std::collections::BTreeMap<u32, Vec<&DiffLine>> =
             std::collections::BTreeMap::new();
 
@@ -220,8 +223,8 @@ impl FileViewer {
                 for dl in removed {
                     let content = truncate_line(&dl.content, config::MAX_LINE_LENGTH);
                     let spans = vec![
-                        Span::styled("   - ", theme::diff_removed_style()),
-                        Span::styled(content, theme::diff_removed_style()),
+                        Span::styled("   - ", theme.diff.removed),
+                        Span::styled(content, theme.diff.removed),
                     ];
                     result.push(Line::from(spans));
                 }
@@ -230,17 +233,17 @@ impl FileViewer {
             if self.change_map.added.contains(&line_num)
                 || self.change_map.modified.contains(&line_num)
             {
-                let gutter_mark_text = theme::gutter_text(&vl.gutter_mark);
-                let gutter_mark_style = theme::gutter_style(&vl.gutter_mark);
+                let gutter_mark_text = crate::theme::gutter_text(&vl.gutter_mark);
+                let gutter_mark_style = theme.change.gutter(&vl.gutter_mark);
                 let content = truncate_line(&vl.content, config::MAX_LINE_LENGTH);
                 let spans = vec![
-                    Span::styled(format!("{} ", vl.line_number), theme::diff_added_style()),
+                    Span::styled(format!("{} ", vl.line_number), theme.diff.added),
                     Span::styled(gutter_mark_text, gutter_mark_style),
-                    Span::styled(content, theme::diff_added_style()),
+                    Span::styled(content, theme.diff.added),
                 ];
                 result.push(Line::from(spans));
             } else {
-                result.push(render_viewer_line(vl));
+                result.push(render_viewer_line(vl, theme));
             }
         }
 
@@ -251,8 +254,8 @@ impl FileViewer {
                 for dl in removed {
                     let content = truncate_line(&dl.content, config::MAX_LINE_LENGTH);
                     let spans = vec![
-                        Span::styled("   - ", theme::diff_removed_style()),
-                        Span::styled(content, theme::diff_removed_style()),
+                        Span::styled("   - ", theme.diff.removed),
+                        Span::styled(content, theme.diff.removed),
                     ];
                     result.push(Line::from(spans));
                 }
@@ -268,18 +271,19 @@ impl FileViewer {
     }
 }
 
-fn render_viewer_line(vl: &ViewerLine) -> Line<'_> {
-    let gutter_mark_text = theme::gutter_text(&vl.gutter_mark);
-    let gutter_mark_style = theme::gutter_style(&vl.gutter_mark);
+fn render_viewer_line<'a>(vl: &'a ViewerLine, theme: &Theme) -> Line<'a> {
+    let gutter_mark_text = crate::theme::gutter_text(&vl.gutter_mark);
+    let gutter_mark_style = theme.change.gutter(&vl.gutter_mark);
 
     let mut spans = vec![
-        dim_line_number(&vl.line_number),
+        dim_line_number(&vl.line_number, theme),
         Span::styled(gutter_mark_text, gutter_mark_style),
     ];
     spans.extend(build_highlighted_spans_owned(
         &vl.content,
         &vl.spans,
         config::MAX_LINE_LENGTH,
+        theme,
     ));
     Line::from(spans)
 }
@@ -309,7 +313,7 @@ mod tests {
         let backend = TestBackend::new(60, 20);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| viewer.render(frame, frame.area()))
+            .draw(|frame| viewer.render(frame, frame.area(), crate::theme::current()))
             .unwrap();
     }
 
@@ -321,7 +325,7 @@ mod tests {
         let backend = TestBackend::new(60, 20);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| viewer.render(frame, frame.area()))
+            .draw(|frame| viewer.render(frame, frame.area(), crate::theme::current()))
             .unwrap();
 
         let buffer = terminal.backend().buffer();
@@ -400,7 +404,7 @@ mod tests {
         let backend = TestBackend::new(60, 20);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| viewer.render(frame, frame.area()))
+            .draw(|frame| viewer.render(frame, frame.area(), crate::theme::current()))
             .unwrap();
 
         let buffer = terminal.backend().buffer();
@@ -424,7 +428,7 @@ mod tests {
         let backend = TestBackend::new(800, 5);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| viewer.render(frame, frame.area()))
+            .draw(|frame| viewer.render(frame, frame.area(), crate::theme::current()))
             .unwrap();
 
         let buffer = terminal.backend().buffer();
@@ -454,7 +458,7 @@ mod tests {
         let backend = TestBackend::new(60, 5);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| viewer.render(frame, frame.area()))
+            .draw(|frame| viewer.render(frame, frame.area(), crate::theme::current()))
             .unwrap();
 
         let buffer = terminal.backend().buffer();
@@ -527,7 +531,7 @@ mod tests {
         let backend = TestBackend::new(60, 10);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| viewer.render(frame, frame.area()))
+            .draw(|frame| viewer.render(frame, frame.area(), crate::theme::current()))
             .unwrap();
 
         let buffer = terminal.backend().buffer();
@@ -571,7 +575,7 @@ mod tests {
         let backend = TestBackend::new(60, 10);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| viewer.render(frame, frame.area()))
+            .draw(|frame| viewer.render(frame, frame.area(), crate::theme::current()))
             .unwrap();
 
         let buffer = terminal.backend().buffer();
@@ -635,7 +639,7 @@ mod tests {
         let backend = TestBackend::new(80, 10);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| viewer.render(frame, frame.area()))
+            .draw(|frame| viewer.render(frame, frame.area(), crate::theme::current()))
             .unwrap();
 
         let buffer = terminal.backend().buffer();
@@ -699,7 +703,7 @@ mod tests {
         let backend = TestBackend::new(60, 10);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| viewer.render(frame, frame.area()))
+            .draw(|frame| viewer.render(frame, frame.area(), crate::theme::current()))
             .unwrap();
 
         let buffer = terminal.backend().buffer();

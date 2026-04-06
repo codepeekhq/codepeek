@@ -5,6 +5,7 @@ use ratatui::widgets::{Block, BorderType, Borders};
 
 use codepeek_core::{ChangeKind, HighlightKind};
 
+#[non_exhaustive]
 #[allow(dead_code)]
 pub struct Palette {
     pub base: Color,
@@ -68,175 +69,186 @@ impl Palette {
     }
 }
 
+#[non_exhaustive]
 pub struct Theme {
-    pub base_bg: Color,
-    pub selected_bg: Color,
-    pub diff_added_bg: Color,
-    pub diff_removed_bg: Color,
+    pub text: TextColors,
+    pub border: BorderColors,
+    pub change: ChangeColors,
+    pub diff: DiffColors,
+    pub syntax: SyntaxColors,
+    pub ui: UiColors,
+    pub selected: Style,
+}
 
-    pub text: Color,
-    pub text_dim: Color,
+#[non_exhaustive]
+pub struct TextColors {
+    pub primary: Style,
+    pub muted: Style,
+    pub deleted_file: Style,
+}
 
-    pub border: Color,
-    pub border_focused: Color,
+#[non_exhaustive]
+#[allow(clippy::struct_field_names)]
+pub struct BorderColors {
+    pub normal_color: Color,
+    pub active_color: Color,
+    pub danger_color: Color,
+    pub danger: Style,
+}
 
-    pub added: Color,
-    pub modified: Color,
-    pub deleted: Color,
-    pub renamed: Color,
+impl BorderColors {
+    pub fn block(&self) -> Block<'static> {
+        rounded_block(self.normal_color)
+    }
 
-    pub syntax_keyword: Color,
-    pub syntax_function: Color,
-    pub syntax_type: Color,
-    pub syntax_property: Color,
-    pub syntax_string: Color,
-    pub syntax_comment: Color,
-    pub syntax_punctuation: Color,
-    pub syntax_number: Color,
-    pub syntax_operator: Color,
-    pub syntax_variable: Color,
-    pub syntax_tag: Color,
+    pub fn active_block(&self) -> Block<'static> {
+        rounded_block(self.active_color)
+    }
 
-    pub accent: Color,
-    pub destructive: Color,
-    pub error_bg: Color,
-    pub error_fg: Color,
-    pub status_key: Color,
-    pub status_desc: Color,
-    pub status_separator: Color,
-    pub diff_added_fg: Color,
-    pub diff_removed_fg: Color,
+    pub fn danger_block(&self) -> Block<'static> {
+        rounded_block(self.danger_color)
+    }
+}
+
+#[non_exhaustive]
+#[allow(clippy::struct_field_names)]
+pub struct ChangeColors {
+    pub added_color: Color,
+    pub modified_color: Color,
+    pub deleted_color: Color,
+    pub renamed_color: Color,
+}
+
+impl ChangeColors {
+    pub fn gutter(&self, mark: &GutterMark) -> Style {
+        match mark {
+            GutterMark::Added => Style::new().fg(self.added_color),
+            GutterMark::Modified => Style::new().fg(self.modified_color),
+            GutterMark::Deleted => Style::new().fg(self.deleted_color),
+            GutterMark::Unchanged => Style::new(),
+        }
+    }
+}
+
+#[non_exhaustive]
+pub struct DiffColors {
+    pub added: Style,
+    pub removed: Style,
+}
+
+#[non_exhaustive]
+pub struct SyntaxColors {
+    pub keyword: Color,
+    pub function: Color,
+    pub r#type: Color,
+    pub property: Color,
+    pub string: Color,
+    pub comment: Color,
+    pub punctuation: Color,
+    pub number: Color,
+    pub operator: Color,
+    pub variable: Color,
+    pub tag: Color,
+}
+
+impl SyntaxColors {
+    pub fn highlight(&self, kind: HighlightKind) -> Style {
+        let color = match kind {
+            HighlightKind::Keyword => self.keyword,
+            HighlightKind::Function => self.function,
+            HighlightKind::Type | HighlightKind::Attribute => self.r#type,
+            HighlightKind::Property => self.property,
+            HighlightKind::String => self.string,
+            HighlightKind::Comment => self.comment,
+            HighlightKind::Punctuation => self.punctuation,
+            HighlightKind::Number | HighlightKind::Constant => self.number,
+            HighlightKind::Operator => self.operator,
+            HighlightKind::Variable => self.variable,
+            HighlightKind::Tag => self.tag,
+        };
+        Style::new().fg(color)
+    }
+}
+
+#[non_exhaustive]
+pub struct UiColors {
+    pub accent: Style,
+    pub hint_key: Style,
+    pub hint_label: Style,
+    pub error_badge: Style,
+    pub error_text: Style,
 }
 
 impl Theme {
     pub fn from_palette(p: &Palette) -> Self {
+        let muted = Style::new().fg(p.overlay0);
+        let primary = Style::new().fg(p.text);
         Self {
-            base_bg: p.base,
-            selected_bg: p.surface0,
-            diff_added_bg: Color::Rgb(30, 56, 36),
-            diff_removed_bg: Color::Rgb(56, 30, 38),
-
-            text: p.text,
-            text_dim: p.overlay0,
-
-            border: p.surface1,
-            border_focused: p.lavender,
-
-            added: p.green,
-            modified: p.yellow,
-            deleted: p.red,
-            renamed: p.sapphire,
-
-            syntax_keyword: p.mauve,
-            syntax_function: p.blue,
-            syntax_type: p.yellow,
-            syntax_property: p.lavender,
-            syntax_string: p.green,
-            syntax_comment: p.overlay0,
-            syntax_punctuation: p.overlay2,
-            syntax_number: p.peach,
-            syntax_operator: p.sky,
-            syntax_variable: p.text,
-            syntax_tag: p.maroon,
-
-            accent: p.mauve,
-            destructive: p.maroon,
-            error_bg: p.red,
-            error_fg: p.red,
-            status_key: p.lavender,
-            status_desc: p.overlay1,
-            status_separator: p.surface2,
-            diff_added_fg: p.green,
-            diff_removed_fg: p.red,
+            text: TextColors {
+                primary,
+                muted,
+                deleted_file: Style::new().fg(p.overlay0).add_modifier(Modifier::DIM),
+            },
+            border: BorderColors {
+                normal_color: p.surface1,
+                active_color: p.lavender,
+                danger_color: p.maroon,
+                danger: Style::new().fg(p.maroon),
+            },
+            change: ChangeColors {
+                added_color: p.green,
+                modified_color: p.yellow,
+                deleted_color: p.red,
+                renamed_color: p.sapphire,
+            },
+            diff: DiffColors {
+                added: Style::new().fg(p.green).bg(Color::Rgb(30, 56, 36)),
+                removed: Style::new().fg(p.red).bg(Color::Rgb(56, 30, 38)),
+            },
+            syntax: SyntaxColors {
+                keyword: p.mauve,
+                function: p.blue,
+                r#type: p.yellow,
+                property: p.lavender,
+                string: p.green,
+                comment: p.overlay0,
+                punctuation: p.overlay2,
+                number: p.peach,
+                operator: p.sky,
+                variable: p.text,
+                tag: p.maroon,
+            },
+            ui: UiColors {
+                accent: Style::new().fg(p.mauve),
+                hint_key: Style::new().fg(p.lavender),
+                hint_label: Style::new().fg(p.overlay1),
+                error_badge: Style::new().fg(Color::Reset).bg(p.red),
+                error_text: Style::new().fg(p.red),
+            },
+            selected: Style::new()
+                .bg(p.surface0)
+                .fg(p.text)
+                .add_modifier(Modifier::BOLD),
         }
     }
 
-    pub fn selected_style(&self) -> Style {
-        Style::new()
-            .bg(self.selected_bg)
-            .fg(self.text)
-            .add_modifier(Modifier::BOLD)
-    }
-
-    pub fn badge_style(&self, kind: &ChangeKind) -> Style {
-        let color = self.change_color(kind);
+    pub fn badge(&self, kind: &ChangeKind) -> Style {
+        let color = match kind {
+            ChangeKind::Added => self.change.added_color,
+            ChangeKind::Modified => self.change.modified_color,
+            ChangeKind::Deleted => self.change.deleted_color,
+            ChangeKind::Renamed { .. } => self.change.renamed_color,
+            ChangeKind::Unchanged => return self.text.muted.add_modifier(Modifier::BOLD),
+        };
         Style::new().fg(color).add_modifier(Modifier::BOLD)
     }
+}
 
-    pub fn highlight_style(&self, kind: HighlightKind) -> Style {
-        let color = match kind {
-            HighlightKind::Keyword => self.syntax_keyword,
-            HighlightKind::Function => self.syntax_function,
-            HighlightKind::Type | HighlightKind::Attribute => self.syntax_type,
-            HighlightKind::Property => self.syntax_property,
-            HighlightKind::String => self.syntax_string,
-            HighlightKind::Comment => self.syntax_comment,
-            HighlightKind::Punctuation => self.syntax_punctuation,
-            HighlightKind::Number | HighlightKind::Constant => self.syntax_number,
-            HighlightKind::Operator => self.syntax_operator,
-            HighlightKind::Variable => self.syntax_variable,
-            HighlightKind::Tag => self.syntax_tag,
-        };
-        Style::new().fg(color)
-    }
-
-    pub fn gutter_style(&self, mark: &GutterMark) -> Style {
-        match mark {
-            GutterMark::Added => Style::new().fg(self.added),
-            GutterMark::Modified => Style::new().fg(self.modified),
-            GutterMark::Deleted => Style::new().fg(self.deleted),
-            GutterMark::Unchanged => Style::new(),
-        }
-    }
-
-    pub fn diff_added_style(&self) -> Style {
-        Style::new().fg(self.diff_added_fg).bg(self.diff_added_bg)
-    }
-
-    pub fn diff_removed_style(&self) -> Style {
-        Style::new()
-            .fg(self.diff_removed_fg)
-            .bg(self.diff_removed_bg)
-    }
-
-    pub fn deleted_file_style(&self) -> Style {
-        Style::new().fg(self.text_dim).add_modifier(Modifier::DIM)
-    }
-
-    pub fn unchanged_file_style(&self) -> Style {
-        Style::new().fg(self.text_dim)
-    }
-
-    pub fn rounded_block(&self) -> Block<'static> {
-        Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::new().fg(self.border))
-    }
-
-    pub fn focused_block(&self) -> Block<'static> {
-        Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::new().fg(self.border_focused))
-    }
-
-    pub fn destructive_block(&self) -> Block<'static> {
-        Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::new().fg(self.destructive))
-    }
-
-    fn change_color(&self, kind: &ChangeKind) -> Color {
-        match kind {
-            ChangeKind::Added => self.added,
-            ChangeKind::Modified => self.modified,
-            ChangeKind::Deleted => self.deleted,
-            ChangeKind::Renamed { .. } => self.renamed,
-            ChangeKind::Unchanged => self.text_dim,
-        }
-    }
+fn rounded_block(border_color: Color) -> Block<'static> {
+    Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(border_color))
 }
 
 impl Default for Theme {
@@ -247,52 +259,11 @@ impl Default for Theme {
 
 static THEME: LazyLock<Theme> = LazyLock::new(Theme::default);
 
+/// Returns the globally-initialized theme. The app reads this once per frame
+/// and passes `&Theme` down through its render tree — components themselves
+/// never call this directly.
 pub fn current() -> &'static Theme {
     &THEME
-}
-
-pub fn selected_style() -> Style {
-    current().selected_style()
-}
-
-pub fn badge_style(kind: &ChangeKind) -> Style {
-    current().badge_style(kind)
-}
-
-pub fn highlight_style(kind: HighlightKind) -> Style {
-    current().highlight_style(kind)
-}
-
-pub fn gutter_style(mark: &GutterMark) -> Style {
-    current().gutter_style(mark)
-}
-
-pub fn diff_added_style() -> Style {
-    current().diff_added_style()
-}
-
-pub fn diff_removed_style() -> Style {
-    current().diff_removed_style()
-}
-
-pub fn deleted_file_style() -> Style {
-    current().deleted_file_style()
-}
-
-pub fn unchanged_file_style() -> Style {
-    current().unchanged_file_style()
-}
-
-pub fn rounded_block() -> Block<'static> {
-    current().rounded_block()
-}
-
-pub fn focused_block() -> Block<'static> {
-    current().focused_block()
-}
-
-pub fn destructive_block() -> Block<'static> {
-    current().destructive_block()
 }
 
 pub fn change_badge(kind: &ChangeKind) -> &'static str {
@@ -315,10 +286,10 @@ pub fn change_label(kind: &ChangeKind) -> &'static str {
     }
 }
 
-#[allow(dead_code)]
 pub enum GutterMark {
     Added,
     Modified,
+    #[allow(dead_code)]
     Deleted,
     Unchanged,
 }
@@ -341,15 +312,14 @@ mod tests {
     fn default_theme_builds_from_catppuccin_mocha() {
         let theme = Theme::default();
         let palette = Palette::catppuccin_mocha();
-        assert_eq!(theme.base_bg, palette.base);
-        assert_eq!(theme.text, palette.text);
-        assert_eq!(theme.added, palette.green);
+        assert_eq!(theme.text.primary.fg, Some(palette.text));
+        assert_eq!(theme.change.added_color, palette.green);
     }
 
     #[test]
     fn current_returns_default_theme() {
         let t = current();
-        assert_eq!(t.base_bg, Palette::catppuccin_mocha().base);
+        assert_eq!(t.text.primary.fg, Some(Palette::catppuccin_mocha().text));
     }
 
     #[test]
@@ -381,28 +351,30 @@ mod tests {
     }
 
     #[test]
-    fn badge_style_returns_correct_colors() {
+    fn badge_returns_correct_colors() {
         let t = current();
-        let added = badge_style(&ChangeKind::Added);
-        assert_eq!(added.fg, Some(t.added));
-
-        let modified = badge_style(&ChangeKind::Modified);
-        assert_eq!(modified.fg, Some(t.modified));
-
-        let deleted = badge_style(&ChangeKind::Deleted);
-        assert_eq!(deleted.fg, Some(t.deleted));
-
-        let renamed = badge_style(&ChangeKind::Renamed {
-            from: PathBuf::from("old.rs"),
-        });
-        assert_eq!(renamed.fg, Some(t.renamed));
-
-        let unchanged = badge_style(&ChangeKind::Unchanged);
-        assert_eq!(unchanged.fg, Some(t.text_dim));
+        assert_eq!(t.badge(&ChangeKind::Added).fg, Some(t.change.added_color));
+        assert_eq!(
+            t.badge(&ChangeKind::Modified).fg,
+            Some(t.change.modified_color)
+        );
+        assert_eq!(
+            t.badge(&ChangeKind::Deleted).fg,
+            Some(t.change.deleted_color)
+        );
+        assert_eq!(
+            t.badge(&ChangeKind::Renamed {
+                from: PathBuf::from("old.rs")
+            })
+            .fg,
+            Some(t.change.renamed_color)
+        );
+        assert_eq!(t.badge(&ChangeKind::Unchanged).fg, t.text.muted.fg);
     }
 
     #[test]
-    fn highlight_style_returns_color_for_all_kinds() {
+    fn highlight_returns_color_for_all_kinds() {
+        let t = current();
         let kinds = [
             HighlightKind::Keyword,
             HighlightKind::Function,
@@ -419,8 +391,7 @@ mod tests {
             HighlightKind::Attribute,
         ];
         for kind in kinds {
-            let style = highlight_style(kind);
-            assert!(style.fg.is_some(), "highlight_style({kind}) should set fg");
+            assert!(t.syntax.highlight(kind).fg.is_some());
         }
     }
 
@@ -433,95 +404,99 @@ mod tests {
     }
 
     #[test]
-    fn gutter_style_added_is_green() {
+    fn gutter_styles_by_mark() {
         let t = current();
-        let style = gutter_style(&GutterMark::Added);
-        assert_eq!(style.fg, Some(t.added));
+        assert_eq!(
+            t.change.gutter(&GutterMark::Added).fg,
+            Some(t.change.added_color)
+        );
+        assert_eq!(
+            t.change.gutter(&GutterMark::Modified).fg,
+            Some(t.change.modified_color)
+        );
+        assert_eq!(
+            t.change.gutter(&GutterMark::Deleted).fg,
+            Some(t.change.deleted_color)
+        );
+        assert_eq!(t.change.gutter(&GutterMark::Unchanged).fg, None);
     }
 
     #[test]
-    fn gutter_style_modified_is_yellow() {
+    fn selected_is_bold_with_surface_bg() {
         let t = current();
-        let style = gutter_style(&GutterMark::Modified);
-        assert_eq!(style.fg, Some(t.modified));
+        assert!(t.selected.add_modifier.contains(Modifier::BOLD));
+        assert!(t.selected.bg.is_some());
     }
 
     #[test]
-    fn gutter_style_deleted_is_red() {
+    fn diff_added_has_green_tones() {
         let t = current();
-        let style = gutter_style(&GutterMark::Deleted);
-        assert_eq!(style.fg, Some(t.deleted));
+        assert_eq!(t.diff.added.fg, Some(Palette::catppuccin_mocha().green));
+        assert!(t.diff.added.bg.is_some());
     }
 
     #[test]
-    fn gutter_style_unchanged_has_no_color() {
-        let style = gutter_style(&GutterMark::Unchanged);
-        assert_eq!(style.fg, None);
-    }
-
-    #[test]
-    fn selected_style_is_bold_with_surface_bg() {
+    fn diff_removed_has_red_tones() {
         let t = current();
-        let style = selected_style();
-        assert_eq!(style.bg, Some(t.selected_bg));
-        assert!(style.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(t.diff.removed.fg, Some(Palette::catppuccin_mocha().red));
+        assert!(t.diff.removed.bg.is_some());
     }
 
     #[test]
-    fn diff_added_style_has_green_tones() {
+    fn deleted_file_is_dim() {
         let t = current();
-        let style = diff_added_style();
-        assert_eq!(style.fg, Some(t.diff_added_fg));
-        assert_eq!(style.bg, Some(t.diff_added_bg));
+        assert!(t.text.deleted_file.add_modifier.contains(Modifier::DIM));
     }
 
     #[test]
-    fn diff_removed_style_has_red_tones() {
+    fn text_primary_and_muted_set_fg() {
         let t = current();
-        let style = diff_removed_style();
-        assert_eq!(style.fg, Some(t.diff_removed_fg));
-        assert_eq!(style.bg, Some(t.diff_removed_bg));
+        assert!(t.text.primary.fg.is_some());
+        assert!(t.text.muted.fg.is_some());
     }
 
     #[test]
-    fn deleted_file_style_is_dim() {
+    fn ui_styles_set_fg() {
         let t = current();
-        let style = deleted_file_style();
-        assert_eq!(style.fg, Some(t.text_dim));
-        assert!(style.add_modifier.contains(Modifier::DIM));
+        assert!(t.ui.accent.fg.is_some());
+        assert!(t.ui.hint_key.fg.is_some());
+        assert!(t.ui.hint_label.fg.is_some());
     }
 
     #[test]
-    fn unchanged_file_style_is_overlay() {
+    fn border_danger_style() {
         let t = current();
-        let style = unchanged_file_style();
-        assert_eq!(style.fg, Some(t.text_dim));
-        assert!(!style.add_modifier.contains(Modifier::DIM));
+        assert_eq!(t.border.danger.fg, Some(t.border.danger_color));
     }
 
     #[test]
-    fn rounded_block_builds_without_panic() {
-        let _ = rounded_block();
+    fn error_badge_has_error_bg_and_reset_fg() {
+        let t = current();
+        assert_eq!(t.ui.error_badge.fg, Some(Color::Reset));
+        assert!(t.ui.error_badge.bg.is_some());
     }
 
     #[test]
-    fn focused_block_builds_without_panic() {
-        let _ = focused_block();
+    fn error_text_has_fg() {
+        let t = current();
+        assert!(t.ui.error_text.fg.is_some());
     }
 
     #[test]
-    fn destructive_block_builds_without_panic() {
-        let _ = destructive_block();
+    fn blocks_build_without_panic() {
+        let t = current();
+        let _ = t.border.block();
+        let _ = t.border.active_block();
+        let _ = t.border.danger_block();
     }
 
     #[test]
     fn from_palette_maps_semantic_tokens_correctly() {
         let p = Palette::catppuccin_mocha();
         let t = Theme::from_palette(&p);
-        assert_eq!(t.syntax_keyword, p.mauve);
-        assert_eq!(t.syntax_function, p.blue);
-        assert_eq!(t.syntax_string, p.green);
-        assert_eq!(t.destructive, p.maroon);
-        assert_eq!(t.status_key, p.lavender);
+        assert_eq!(t.syntax.keyword, p.mauve);
+        assert_eq!(t.syntax.function, p.blue);
+        assert_eq!(t.syntax.string, p.green);
+        assert_eq!(t.border.danger_color, p.maroon);
     }
 }

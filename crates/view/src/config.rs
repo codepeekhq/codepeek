@@ -11,11 +11,12 @@ pub const BINARY_DETECTION_LIMIT: usize = 8192;
 /// Outer margin around the entire UI (cells on each side).
 pub const OUTER_MARGIN: u16 = 1;
 
-pub const FILE_LIST_WIDTH_PERCENT: u16 = 28;
-pub const FILE_VIEWER_WIDTH_PERCENT: u16 = 72;
-
 pub const POPUP_WIDTH_PERCENT: u16 = 70;
 pub const POPUP_HEIGHT_PERCENT: u16 = 80;
 
-/// Gap between adjacent panels (cells).
-pub const PANEL_GAP: u16 = 1;
+/// Max width for the file list in zen mode (cells).
+pub const ZEN_FILE_LIST_MAX_WIDTH: u16 = 60;
+/// Width percentage for the file viewer in zen mode.
+pub const ZEN_VIEWER_WIDTH_PERCENT: u16 = 80;
+/// Max height percentage for the file list in zen mode.
+pub const ZEN_FILE_LIST_MAX_HEIGHT_PERCENT: u16 = 70;

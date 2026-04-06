@@ -2,9 +2,13 @@ use ratatui::text::Span;
 
 use codepeek_core::HighlightSpan;
 
-use crate::theme;
+use crate::theme::Theme;
 
-pub fn build_highlighted_spans<'a>(content: &'a str, spans: &[HighlightSpan]) -> Vec<Span<'a>> {
+pub fn build_highlighted_spans<'a>(
+    content: &'a str,
+    spans: &[HighlightSpan],
+    theme: &Theme,
+) -> Vec<Span<'a>> {
     if spans.is_empty() {
         return vec![Span::raw(content)];
     }
@@ -21,7 +25,7 @@ pub fn build_highlighted_spans<'a>(content: &'a str, spans: &[HighlightSpan]) ->
         if start < end {
             result.push(Span::styled(
                 &content[start..end],
-                theme::highlight_style(hs.kind),
+                theme.syntax.highlight(hs.kind),
             ));
         }
         cursor = end;
@@ -38,6 +42,7 @@ pub fn build_highlighted_spans_owned(
     content: &str,
     spans: &[HighlightSpan],
     max_length: usize,
+    theme: &Theme,
 ) -> Vec<Span<'static>> {
     let truncated;
     let display_content = if content.len() > max_length {
@@ -63,7 +68,7 @@ pub fn build_highlighted_spans_owned(
         if start < end {
             result.push(Span::styled(
                 display_content[start..end].to_string(),
-                theme::highlight_style(hs.kind),
+                theme.syntax.highlight(hs.kind),
             ));
         }
         cursor = end;
@@ -94,11 +99,8 @@ pub fn truncate_line(content: &str, max_length: usize) -> String {
     }
 }
 
-pub fn dim_line_number(number: &str) -> Span<'static> {
-    Span::styled(
-        format!("{number} "),
-        ratatui::style::Style::new().fg(theme::current().text_dim),
-    )
+pub fn dim_line_number(number: &str, theme: &Theme) -> Span<'static> {
+    Span::styled(format!("{number} "), theme.text.muted)
 }
 
 #[cfg(test)]
@@ -106,6 +108,7 @@ mod tests {
     use codepeek_core::HighlightKind;
 
     use super::*;
+    use crate::theme;
 
     #[test]
     fn line_number_width_for_various_sizes() {
@@ -134,13 +137,13 @@ mod tests {
 
     #[test]
     fn highlighted_spans_empty_source() {
-        let spans = build_highlighted_spans("", &[]);
+        let spans = build_highlighted_spans("", &[], theme::current());
         assert_eq!(spans.len(), 1);
     }
 
     #[test]
     fn highlighted_spans_no_highlights() {
-        let spans = build_highlighted_spans("hello world", &[]);
+        let spans = build_highlighted_spans("hello world", &[], theme::current());
         assert_eq!(spans.len(), 1);
     }
 
@@ -153,6 +156,7 @@ mod tests {
                 end: 2,
                 kind: HighlightKind::Keyword,
             }],
+            theme::current(),
         );
         assert_eq!(spans.len(), 2);
     }
@@ -166,6 +170,7 @@ mod tests {
                 end: 100,
                 kind: HighlightKind::Keyword,
             }],
+            theme::current(),
         );
         assert_eq!(spans.len(), 1);
     }
@@ -173,7 +178,7 @@ mod tests {
     #[test]
     fn highlighted_spans_owned_truncates() {
         let long = "x".repeat(600);
-        let spans = build_highlighted_spans_owned(&long, &[], 500);
+        let spans = build_highlighted_spans_owned(&long, &[], 500, theme::current());
         assert_eq!(spans.len(), 1);
         let text = spans[0].content.to_string();
         assert!(text.ends_with('\u{2026}'));
@@ -195,6 +200,7 @@ mod tests {
                     kind: HighlightKind::Number,
                 },
             ],
+            theme::current(),
         );
         assert_eq!(spans.len(), 3);
     }

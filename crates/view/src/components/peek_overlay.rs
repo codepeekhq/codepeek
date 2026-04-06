@@ -11,8 +11,9 @@ use codepeek_core::{HighlightSpan, HighlightedLine};
 use crate::action::Action;
 use crate::config;
 use crate::keybindings;
+use crate::layout;
 use crate::render_helpers::{build_highlighted_spans, dim_line_number, line_number_width};
-use crate::theme;
+use crate::theme::Theme;
 
 struct PeekLine {
     line_number: String,
@@ -73,21 +74,19 @@ impl PeekOverlay {
         }
     }
 
-    pub fn render(&self, frame: &mut Frame, area: Rect) {
-        let popup = centered_rect(
+    pub fn render(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
+        let popup = layout::centered_rect(
             area,
             config::POPUP_WIDTH_PERCENT,
             config::POPUP_HEIGHT_PERCENT,
         );
         frame.render_widget(Clear, popup);
 
-        let t = theme::current();
         let title = format!(" Deleted: {} ", self.file_path.display());
-        let block = theme::destructive_block()
-            .title(Span::styled(
-                title,
-                ratatui::style::Style::new().fg(t.destructive),
-            ))
+        let block = theme
+            .border
+            .danger_block()
+            .title(Span::styled(title, theme.border.danger))
             .padding(Padding::new(1, 1, 0, 0));
 
         let inner = block.inner(popup);
@@ -99,8 +98,8 @@ impl PeekOverlay {
             .skip(self.scroll_offset)
             .take(visible_height)
             .map(|pl| {
-                let mut spans = vec![dim_line_number(&pl.line_number)];
-                spans.extend(build_highlighted_spans(&pl.content, &pl.spans));
+                let mut spans = vec![dim_line_number(&pl.line_number, theme)];
+                spans.extend(build_highlighted_spans(&pl.content, &pl.spans, theme));
                 Line::from(spans)
             })
             .collect();
@@ -108,14 +107,6 @@ impl PeekOverlay {
         let paragraph = Paragraph::new(lines).block(block);
         frame.render_widget(paragraph, popup);
     }
-}
-
-fn centered_rect(area: Rect, percent_x: u16, percent_y: u16) -> Rect {
-    let width = area.width * percent_x / 100;
-    let height = area.height * percent_y / 100;
-    let x = area.x + (area.width.saturating_sub(width)) / 2;
-    let y = area.y + (area.height.saturating_sub(height)) / 2;
-    Rect::new(x, y, width, height)
 }
 
 #[cfg(test)]
@@ -161,7 +152,7 @@ mod tests {
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| overlay.render(frame, frame.area()))
+            .draw(|frame| overlay.render(frame, frame.area(), crate::theme::current()))
             .unwrap();
 
         let buffer = terminal.backend().buffer();
@@ -242,24 +233,6 @@ mod tests {
 
         overlay.handle_event(make_key(KeyCode::PageUp));
         assert_eq!(overlay.scroll_offset, 0);
-    }
-
-    #[test]
-    fn centered_rect_computes_correct_dimensions() {
-        let area = Rect::new(0, 0, 100, 50);
-        let popup = centered_rect(area, 70, 80);
-        assert_eq!(popup.width, 70);
-        assert_eq!(popup.height, 40);
-        assert_eq!(popup.x, 15);
-        assert_eq!(popup.y, 5);
-    }
-
-    #[test]
-    fn centered_rect_with_small_area() {
-        let area = Rect::new(0, 0, 10, 10);
-        let popup = centered_rect(area, 70, 80);
-        assert_eq!(popup.width, 7);
-        assert_eq!(popup.height, 8);
     }
 
     #[test]

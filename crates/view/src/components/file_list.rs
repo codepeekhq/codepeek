@@ -7,7 +7,7 @@ use ratatui::widgets::{List, ListItem, ListState, Padding};
 
 use crate::action::Action;
 use crate::keybindings;
-use crate::theme;
+use crate::theme::{self, Theme};
 
 pub struct FileList {
     files: Vec<FileChange>,
@@ -70,12 +70,11 @@ impl FileList {
         }
     }
 
-    pub fn render(&self, frame: &mut Frame, area: Rect) {
-        self.render_with_focus(frame, area, true);
+    pub fn render(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
+        self.render_with_focus(frame, area, theme, true);
     }
 
-    pub fn render_with_focus(&self, frame: &mut Frame, area: Rect, focused: bool) {
-        let t = theme::current();
+    pub fn render_with_focus(&self, frame: &mut Frame, area: Rect, theme: &Theme, focused: bool) {
         let changed_count = self
             .files
             .iter()
@@ -83,17 +82,14 @@ impl FileList {
             .count();
 
         let title_line = Line::from(vec![
-            Span::styled(" Changes ", ratatui::style::Style::new().fg(t.text)),
-            Span::styled(
-                format!("{changed_count} "),
-                ratatui::style::Style::new().fg(t.text_dim),
-            ),
+            Span::styled(" Changes ", theme.text.primary),
+            Span::styled(format!("{changed_count} "), theme.text.muted),
         ]);
 
         let block = if focused {
-            theme::focused_block()
+            theme.border.active_block()
         } else {
-            theme::rounded_block()
+            theme.border.block()
         }
         .title(title_line)
         .padding(Padding::new(1, 1, 1, 0));
@@ -104,27 +100,24 @@ impl FileList {
             .map(|(text, kind)| {
                 let badge = theme::change_badge(kind);
                 let label = theme::change_label(kind);
-                let badge_style = theme::badge_style(kind);
+                let badge_style = theme.badge(kind);
 
                 let file_style = if *kind == ChangeKind::Deleted {
-                    theme::deleted_file_style()
+                    theme.text.deleted_file
                 } else if *kind == ChangeKind::Unchanged {
-                    theme::unchanged_file_style()
+                    theme.text.muted
                 } else {
-                    ratatui::style::Style::new().fg(t.text)
+                    theme.text.primary
                 };
 
                 let mut spans = vec![
                     Span::styled(badge.to_string(), badge_style),
-                    Span::styled("  ", ratatui::style::Style::new()),
+                    Span::raw("  "),
                     Span::styled(text.clone(), file_style),
                 ];
 
                 if !label.is_empty() {
-                    spans.push(Span::styled(
-                        format!("  {label}"),
-                        ratatui::style::Style::new().fg(t.text_dim),
-                    ));
+                    spans.push(Span::styled(format!("  {label}"), theme.text.muted));
                 }
 
                 ListItem::new(Line::from(spans))
@@ -133,7 +126,7 @@ impl FileList {
 
         let list = List::new(items)
             .block(block)
-            .highlight_style(theme::selected_style())
+            .highlight_style(theme.selected)
             .highlight_spacing(ratatui::widgets::HighlightSpacing::Always);
 
         let mut state = ListState::default();
@@ -209,7 +202,7 @@ mod tests {
         let backend = TestBackend::new(40, 10);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| list.render(frame, frame.area()))
+            .draw(|frame| list.render(frame, frame.area(), theme::current()))
             .unwrap();
     }
 
@@ -279,7 +272,7 @@ mod tests {
         let backend = TestBackend::new(60, 10);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| list.render(frame, frame.area()))
+            .draw(|frame| list.render(frame, frame.area(), theme::current()))
             .unwrap();
 
         let buffer = terminal.backend().buffer();
@@ -370,7 +363,7 @@ mod tests {
         let backend = TestBackend::new(40, 10);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| list.render(frame, frame.area()))
+            .draw(|frame| list.render(frame, frame.area(), theme::current()))
             .unwrap();
 
         let buffer = terminal.backend().buffer();
@@ -397,7 +390,7 @@ mod tests {
         let backend = TestBackend::new(40, 10);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| list.render(frame, frame.area()))
+            .draw(|frame| list.render(frame, frame.area(), theme::current()))
             .unwrap();
 
         let buffer = terminal.backend().buffer();
@@ -408,7 +401,7 @@ mod tests {
             .collect();
         assert!(
             content.contains('\u{2715}'),
-            "should show ✕ badge for deleted"
+            "should show \u{2715} badge for deleted"
         );
         assert!(content.contains("gone.rs"), "should show file path");
     }
@@ -420,7 +413,7 @@ mod tests {
         let backend = TestBackend::new(50, 10);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| list.render(frame, frame.area()))
+            .draw(|frame| list.render(frame, frame.area(), theme::current()))
             .unwrap();
 
         let buffer = terminal.backend().buffer();

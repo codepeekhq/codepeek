@@ -34,3 +34,11 @@
 - 2026-04-05: `LazyLock<Theme>` for global theme access via `theme::current()` — zero-cost after init, avoids threading `&Theme` through all render signatures; migrate to pass-through `&Theme` when runtime theme switching is needed
 - 2026-04-05: Free function re-exports in theme module (e.g., `theme::selected_style()`) delegate to `current()` — keeps call sites unchanged while backing everything with the Theme struct
 - 2026-04-05: UI visual refinements — rounded borders, Unicode change badges (+/●/✕/‣/·), outer margin, panel gaps, focused vs unfocused border distinction
+- 2026-04-06: Zen-mode layout replaces split-panel IDE layout — file list and viewer are single-view centered transitions, no side-by-side panels; extracted `layout.rs` with `ZenLayout { content, status }` and `zen_file_list_layout` / `zen_viewer_layout` helpers
+- 2026-04-06: Transparent root — `App::render` no longer paints a background fill, letting the terminal's native background show through around the centered content
+- 2026-04-06: `Theme` threaded through render methods via `&Theme` parameter — `App::render` reads `theme::current()` once per frame and passes the reference down through every component; components never call `theme::current()` directly, preserving view-function purity per TEA principles
+- 2026-04-06: Theme sub-structs store pre-computed `Style` data — `TextColors`, `DiffColors`, `UiColors`, and `Theme::selected` hold ready-to-use `Style` values built once in `from_palette`; runtime-parameterized styles (`Theme::badge(kind)`, `ChangeColors::gutter(mark)`, `SyntaxColors::highlight(kind)`) and block constructors (`BorderColors::block` / `active_block` / `danger_block`) remain as methods
+- 2026-04-06: `#[non_exhaustive]` on all public theme structs — adding fields is a non-breaking change
+- 2026-04-06: `ErrorBar` component extracted to `components/error_bar.rs` — deduplicates error rendering shared between file list and viewer views
+- 2026-04-06: `StatusBar::render` is always centered — the non-centered variant was removed as unused
+- 2026-04-06: Dead layout constants removed from `config.rs` (`FILE_LIST_WIDTH_PERCENT`, `FILE_VIEWER_WIDTH_PERCENT`, `PANEL_GAP`) — obsoleted by the zen-mode single-view layout
