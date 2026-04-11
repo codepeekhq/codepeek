@@ -1,6 +1,11 @@
 # Multi-View Homepage
 
-> **Revision history:** v1 drafted 2026-04-07. v2 revised 2026-04-08 after a deep review against the rust-style-guide notebook (see Architectural decisions section for what changed and why).
+> **Revision history**
+> - **v1** drafted 2026-04-07 — initial multi-view design.
+> - **v2** revised 2026-04-08 after a deep review against the **rust-style-guide** notebook (Rc/RefCell, exhaustive match, newtype IDs, tempfile atomic writes, mpsc loading).
+> - **v3** revised 2026-04-11 after a deep review against the **software-architecture-guide** notebook (Screaming Architecture, Bounded Contexts, Dependency Inversion, composition root placement, application layer) **plus** a second pass of the rust-style-guide notebook (CommitSha memory footprint, `#[non_exhaustive]` scoping, explicit Component Architecture naming).
+>
+> **v3 is a structural revision.** The user experience of every milestone is unchanged from v2, but the code is reorganized around bounded contexts with an explicit application layer. See **"What v3 changes vs v2"** near the top of the Architecture section for the full diff.
 
 ## Summary
 
@@ -34,81 +39,356 @@ The existing zen-mode aesthetic (single-view, centered, transparent root) is pre
 - **Pinned files** — punted; revisit after Tags ships and we know whether the distinction is needed.
 - **`tokio` / async runtime.** Background work uses `std::thread::spawn` + `std::sync::mpsc`, not async/await. Reasoning: the render loop is single-threaded by nature and the I/O patterns we need (one-shot scans, JSONL reads, git2 calls) don't benefit from a runtime. Adding tokio is its own architectural decision.
 - **Theme/colorscheme switching, custom keybindings UI, settings view.** Not in this plan.
+- **A Command/Query Bus.** The application layer in v3 exposes use cases directly. A command bus (with handler registration) is a future refactor if cross-cutting concerns like audit logging or command history appear.
 
 ---
 
 ## Architecture
 
-### Crate structure (additions)
+### Driving principles
+
+Three principles frame every architectural decision below:
+
+1. **Screaming Architecture** — at the module level, the code organization reveals *what codepeek does*, not *which tools it uses*. Opening `crates/core/src/` shows `changes/`, `tags/`, `sessions/`, `search/`, `todos/`, `branches/` — the bounded contexts of a source code explorer — not `controllers/`, `repositories/`, `services/`.
+2. **Dependency Inversion** — dependencies point strictly inward toward the domain core. Outer layers (infrastructure adapters, UI chrome) know about inner layers (ports, domain entities). Inner layers know *nothing* about outer layers. A crate-level graph enforces this with no cycles.
+3. **Component Architecture (explicitly, not TEA)** — presentation follows ratatui's Component Architecture template, not The Elm Architecture. Each view encapsulates its own state and handlers; the central `Action` enum only carries cross-cutting concerns (navigation, quit, palette open, cross-view open). Per-view state mutations happen inline inside each view's `handle_event`. v3 names this pattern explicitly — v2 adopted it quietly.
+
+### Layered view (concentric rings)
 
 ```
-crates/
-  core/         (extended)  new types (Tag, Todo, SessionInfo, CommitInfo,
-                            BranchInfo, ActivityEntry), newtype IDs (TagId,
-                            SessionId, CommitSha), input structs (NewTag),
-                            new traits (SessionStore, TagStore, TodoScanner,
-                            FileSearcher, CommitLog)
-  git/          (extended)  CommitLog impl on GitChangeDetector
-  syntax/       (unchanged)
-  view/         (heavy ext) View enum, Router, ViewId, views.rs + views/,
-                            background loading infrastructure (LoadState<T>),
-                            CommandPalette overlay, hierarchical Action enum,
-                            App refactor
-  sessions/     (NEW)       Claude Code session discovery & metadata
-  search/       (NEW)       File-name and TODO scanning over a workdir
-  store/        (NEW)       JSON-backed persistent storage (tags)
+            ┌──────────────────────────────────────────────┐
+            │               apps/tui (binary)              │
+            │           COMPOSITION ROOT ONLY               │
+            │   builds adapters → wraps in use cases →      │
+            │   injects use cases into Router → runs App    │
+            └───────────────────┬──────────────────────────┘
+                                │
+         ┌──────────────────────┴──────────────────────┐
+         │                                             │
+         ▼                                             ▼
+   ┌──────────┐                            ┌─────────────────────┐
+   │   view   │                            │  Infrastructure     │
+   │  crate   │                            │  (5 adapter crates) │
+   │          │                            │                     │
+   │ Every    │                            │  git, syntax,       │
+   │ ViewX    │                            │  store, sessions,   │
+   │ holds    │                            │  search             │
+   │ Rc<UC>   │                            │                     │
+   │ only     │                            │  Each impls one or  │
+   │          │                            │  more domain ports  │
+   └────┬─────┘                            └──────────┬──────────┘
+        │                                             │
+        │     BOTH sides depend on the inner core     │
+        ▼                                             ▼
+   ┌─────────────────────────────────────────────────────────┐
+   │                      core crate                         │
+   │                                                         │
+   │  ┌──────────────┐   APPLICATION LAYER                   │
+   │  │ Use cases    │   (orchestrate the domain)            │
+   │  │ per context  │                                       │
+   │  └──────┬───────┘                                       │
+   │         │ depends on                                    │
+   │         ▼                                               │
+   │  ┌──────────────┐   DOMAIN LAYER                        │
+   │  │ Entities +   │   (pure business types)               │
+   │  │ Value Obj +  │                                       │
+   │  │ Ports        │   (trait definitions)                 │
+   │  │ per context  │                                       │
+   │  └──────────────┘                                       │
+   │                                                         │
+   │  ┌──────────────┐   SHARED KERNEL                       │
+   │  │ HighlightXxx │   (minimal cross-context types)       │
+   │  │ ActivityXxx  │                                       │
+   │  └──────────────┘                                       │
+   │                                                         │
+   │   core has zero Rust dependencies beyond thiserror,     │
+   │   serde (for ID round-trip), and std. No ratatui,       │
+   │   no git2, no tree-sitter, no ignore, no regex, no dirs.│
+   └─────────────────────────────────────────────────────────┘
+                  ↑
+         All arrows point inward.
+      Domain knows nothing about Application.
+      Application knows nothing about Infra.
+     Infra and UI know about Application + Domain.
+      Binary knows about everything and wires it together.
+```
+
+### Bounded contexts
+
+Each bounded context is a self-contained slice of the domain. Adding a new context is additive — it does not force changes to the existing ones. The contexts for codepeek:
+
+```
+┌───────────────┐ ┌───────────────┐ ┌───────────────┐ ┌───────────────┐
+│   changes     │ │    tags       │ │   sessions    │ │   branches    │
+├───────────────┤ ├───────────────┤ ├───────────────┤ ├───────────────┤
+│ entities:     │ │ entities:     │ │ entities:     │ │ entities:     │
+│  FileChange   │ │  Tag          │ │  SessionInfo  │ │  BranchInfo   │
+│  ChangeKind   │ │  NewTag<'a>   │ │               │ │  CommitInfo   │
+│  DiffHunk     │ │               │ │ value objs:   │ │               │
+│  DiffLine     │ │ value objs:   │ │  SessionId    │ │ value objs:   │
+│  LineChange   │ │  TagId        │ │               │ │  CommitSha    │
+│  ChangeMap    │ │  TagKind      │ │ port:         │ │               │
+│               │ │               │ │  SessionStore │ │ port:         │
+│ port:         │ │ port:         │ │ use cases:    │ │  CommitLog    │
+│  ChangeDetec. │ │  TagStore     │ │  ListRepoSes. │ │ use cases:    │
+│ use cases:    │ │ use cases:    │ │               │ │  ListBranches │
+│  RefreshCh.   │ │  AddTag       │ │               │ │  RecentComm.  │
+│  OpenChgFile  │ │  ListTags     │ │               │ │  ReadAtCommit │
+│  PeekDeleted  │ │  RemoveTag    │ │               │ │               │
+└───────────────┘ └───────────────┘ └───────────────┘ └───────────────┘
+
+┌───────────────┐ ┌───────────────┐
+│    search     │ │    todos      │
+├───────────────┤ ├───────────────┤
+│ port:         │ │ entities:     │
+│  FileSearcher │ │  TodoItem     │
+│ use cases:    │ │  TodoKind     │
+│  FindFilesBy. │ │ port:         │
+│               │ │  TodoScanner  │
+│               │ │ use cases:    │
+│               │ │  ScanRepoTod. │
+└───────────────┘ └───────────────┘
+
+          ┌────────────────────────────────┐
+          │        SHARED KERNEL           │
+          ├────────────────────────────────┤
+          │  HighlightedLine               │
+          │  HighlightSpan                 │
+          │  HighlightKind                 │
+          │  SyntaxHighlighter (trait)     │   — cross-cutting render port
+          │  SyntaxError                   │
+          │  ActivityEntry                 │   — cross-context read aggregator type
+          │  ActivityKind                  │
+          │  ActivityTarget                │
+          └────────────────────────────────┘
+```
+
+Rules for what belongs in the Shared Kernel:
+- **Only what must be shared** across multiple bounded contexts
+- **Only minimal types** — no entities with their own business rules
+- **The `SyntaxHighlighter` port is exceptionally kernel-level** because every view that displays source code uses it and it's not owned by any single context (if we put it in `changes`, `tags`/`search`/`todos` would have to import from `changes` for a completely unrelated concern).
+- **`ActivityEntry` and friends live in the kernel** because `home` reads them from every context and needs a shared shape; putting them in `home` would force every context to depend on `home` (violating the acyclic rule).
+
+### Crate structure (v3 — same crate count as v2, internally reorganized)
+
+The Rust notebook's "prefer small crates" and the architecture notebook's "package by component" pull in two directions. Small crates help compile time and API stability. Package-by-component helps cognitive load and Screaming Architecture. For codepeek's current scale, **v3 keeps the v2 crate count roughly the same but reorganizes modules inside each crate by bounded context**. The new external adapters (store, sessions, search) are still their own crates because their external dependencies are distinct.
+
+```
 apps/
-  tui/          (extended)  wires the new crates, builds the Router, owns
-                            background worker spawning
+  tui/                    COMPOSITION ROOT (thin binary)
+    src/
+      main.rs             build adapters → build use cases → build Router → run App
+      app.rs              App struct + run loop + event dispatch
+      router.rs           Router::build(ViewId) → View
+      views_enum.rs       pub enum View { Home, Changes, … } + exhaustive delegates
+      stubs.rs             NullTagStore, NullSessionStore fallbacks for graceful degradation
+      config.rs           AppConfig TOML loader (existing)
+
+crates/
+  core/                   DOMAIN + APPLICATION + SHARED KERNEL
+    src/
+      lib.rs              top-level re-exports
+      kernel/             Shared Kernel — cross-context primitives
+        mod.rs
+        highlight.rs      HighlightedLine, HighlightSpan, HighlightKind
+        activity.rs       ActivityEntry, ActivityKind, ActivityTarget
+      syntax/             Cross-cutting rendering port
+        mod.rs
+        port.rs           trait SyntaxHighlighter { highlight(&mut self, …) }
+        error.rs          SyntaxError
+      changes/            Bounded context: Changes
+        mod.rs
+        domain.rs         FileChange, ChangeKind, DiffHunk, DiffLine, LineChange, ChangeMap
+        port.rs           trait ChangeDetector
+        error.rs          ChangeError
+        app.rs            RefreshChangesUseCase, OpenChangedFileUseCase, PeekDeletedFileUseCase
+      tags/               Bounded context: Tags
+        mod.rs
+        domain.rs         Tag, TagId, TagKind, NewTag<'a>
+        port.rs           trait TagStore
+        error.rs          TagError
+        app.rs            AddTagUseCase, ListTagsUseCase, RemoveTagUseCase
+      sessions/           Bounded context: Sessions
+        mod.rs
+        domain.rs         SessionInfo, SessionId
+        port.rs           trait SessionStore
+        error.rs          SessionError
+        app.rs            ListRepoSessionsUseCase
+      search/             Bounded context: Search
+        mod.rs
+        domain.rs         FileMatch (newtype: path + score)
+        port.rs           trait FileSearcher
+        error.rs          SearchError
+        app.rs            FindFilesByQueryUseCase
+      todos/              Bounded context: Todos
+        mod.rs
+        domain.rs         TodoItem, TodoKind
+        port.rs           trait TodoScanner
+        error.rs          TodoError
+        app.rs            ScanRepoTodosUseCase
+      branches/           Bounded context: Branches
+        mod.rs
+        domain.rs         CommitInfo, CommitSha, BranchInfo
+        port.rs           trait CommitLog
+        error.rs          BranchError
+        app.rs            ListBranchesUseCase, RecentCommitsUseCase, ReadAtCommitUseCase
+
+  git/                    INFRASTRUCTURE ADAPTER (git2 → changes + branches ports)
+    src/
+      lib.rs
+      detector.rs         GitChangeDetector — impls both ChangeDetector AND CommitLog
+                          (one struct, two trait impls; the crate's only export)
+
+  syntax/                 INFRASTRUCTURE ADAPTER (tree-sitter → SyntaxHighlighter port)
+    src/
+      (existing structure unchanged)
+
+  store/                  (NEW) INFRASTRUCTURE ADAPTER (JSON file → TagStore port)
+    src/
+      lib.rs
+      json_tag_store.rs   JsonTagStore — impls TagStore
+      file.rs             TagFile (the on-disk shape)
+
+  sessions/               (NEW) INFRASTRUCTURE ADAPTER (Claude JSONL → SessionStore port)
+    src/
+      lib.rs
+      claude_store.rs     ClaudeSessionStore — impls SessionStore
+      jsonl.rs            streaming line reader + minimal parse helpers
+
+  search/                 (NEW) INFRASTRUCTURE ADAPTER (ignore crate → FileSearcher + TodoScanner)
+    src/
+      lib.rs
+      ripgrep_like.rs     RipgrepLikeSearcher — impls FileSearcher
+      todo_scanner.rs     TodoCommentScanner — impls TodoScanner
+      walk.rs             shared WalkBuilder configuration
+
+  view/                   PRESENTATION — chrome + per-context views
+    src/
+      lib.rs              re-exports only what apps/tui needs
+      chrome/             Shared UI framework, no context-specific logic
+        mod.rs
+        theme.rs          Palette, Theme, semantic tokens (unchanged from v2)
+        layout.rs         ZenLayout helpers (extended for Home)
+        loading.rs        LoadState<T>, mpsc channel helpers
+        render_helpers.rs (unchanged)
+        keybindings.rs    (extended with nav_target, is_palette, is_mark_issue, is_mark_fix)
+        action.rs         Action enum — cross-cutting concerns only
+        components.rs     re-exports
+        components/
+          status_bar.rs
+          error_bar.rs
+          peek_overlay.rs
+          spinner.rs         (NEW)
+          text_input.rs      (NEW)
+          command_palette.rs (NEW)
+          file_list.rs       (the FileList widget — used by changes view)
+          file_viewer.rs     (the FileViewer widget — used by changes + file_viewer views)
+      views.rs            sibling file for views/
+      views/
+        mod.rs            (implicit via sibling file)
+        home.rs           HomeView + ActivityFeedAggregator (reads every context)
+        changes.rs        ChangesView (orchestrates FileList + FileViewer + PeekOverlay)
+        tags.rs           TagsView
+        sessions.rs       SessionsView
+        search.rs         SearchView
+        todos.rs          TodosView
+        branches.rs       BranchesView
+        file_viewer.rs    FileViewerView (the top-level view, distinct from the component)
 ```
 
-### Dependency graph
+Crate count: **1 binary + 8 libraries = 9**, same as v2 (`core`, `git`, `syntax`, `view` today + `store`, `sessions`, `search` new). v3 doesn't add any crates; it reshapes what's *inside* them.
+
+### Dependency graph (crate-level, v3)
 
 ```
-apps/tui ──> codepeek-view ──> codepeek-core
-         ├─> codepeek-git ────> codepeek-core
-         ├─> codepeek-syntax ─> codepeek-core
-         ├─> codepeek-sessions > codepeek-core
-         ├─> codepeek-search ─> codepeek-core
-         └─> codepeek-store ──> codepeek-core
+                       ┌────────┐
+                       │apps/tui│
+                       └────┬───┘
+                            │
+         ┌──────┬──────┬────┼────┬──────┬──────┐
+         │      │      │    │    │      │      │
+         ▼      ▼      ▼    ▼    ▼      ▼      ▼
+      ┌────┐ ┌────┐ ┌────┐┌────┐┌────┐┌────┐┌────┐
+      │view│ │git │ │synt││stor││sess││sear│ (infra adapters)
+      └──┬─┘ └──┬─┘ └──┬─┘└──┬─┘└──┬─┘└──┬─┘
+         │      │      │    │    │    │
+         └──────┴──────┴────┼────┴────┴────┐
+                            │              │
+                            ▼              ▼
+                         ┌────┐          ┌────┐
+                         │core│          │core│  (same crate)
+                         └────┘          └────┘
 ```
 
-Key constraint (unchanged from change-viewer plan): **`codepeek-view` depends only on `codepeek-core`, never on `git` / `syntax` / `sessions` / `search` / `store` directly.** All implementations are injected through traits defined in `core`. This keeps the view layer testable with stub data and prevents circular complexity.
+Enforced rules:
+- **`core` depends on nothing codepeek-specific.** Only `thiserror`, `serde`, `std`.
+- **Each infra adapter crate (`git`, `syntax`, `store`, `sessions`, `search`) depends on `core` only.** It does NOT depend on `view`. It does NOT depend on other infra crates.
+- **`view` depends on `core` only.** It does NOT depend on any infra crate. (The view layer talks to adapters exclusively through the ports defined in `core`, and receives concrete adapter instances only via the Router wiring in `apps/tui`.)
+- **`apps/tui` depends on everything.** It is the only place that knows which concrete adapter implements which port, and the only place that constructs use cases.
 
-### Why three new crates instead of one or zero
+No cycles are possible. Every crate has a single stable direction of import. **v3 adds a workspace check script** (`scripts/check_dep_graph.sh`) to M1 that parses each `Cargo.toml` and asserts these rules so they cannot silently drift.
 
-This decision was challenged in the v2 review and explicitly validated by the rust-style-guide notebook against *Rust Design Patterns* §3.3.2 "Prefer Small Crates" and the Ratatui workspace's own `ratatui-core` / `ratatui-widgets` / backend split.
+### Dependency graph (module-level, inside `core`)
 
-Each new crate has a single, distinct external dependency surface:
+```
+                  apps/tui / view
+                        │ (imports use cases)
+                        ▼
+    core::{changes,tags,sessions,search,todos,branches}::app
+                        │ (uses)
+                        ▼
+    core::{changes,tags,sessions,search,todos,branches}::{port,domain,error}
+                        │ (uses)
+                        ▼
+                 core::kernel::{highlight,activity}
+                 core::syntax::{port,error}
+```
 
-| Crate | Concern | External deps |
-|-------|---------|---------------|
-| `codepeek-sessions` | Read Claude Code session JSONLs | `serde_json`, `dirs` |
-| `codepeek-search` | File-name and content scanning | `ignore`, `regex` |
-| `codepeek-store` | Atomic JSON-backed persistent storage | `serde_json`, `dirs`, `tempfile` |
+Inside each bounded context module, the layering is strict:
+- `app` may import `port`, `domain`, `error` from its own context AND anything from `kernel`/`syntax`
+- `port` may import `domain`, `error` from its own context AND anything from `kernel`
+- `domain` may import only from `kernel`
+- **No bounded context module imports from another bounded context module** — e.g. `core::tags::app` cannot import `core::changes::domain`. Cross-context coordination happens in the composition root (apps/tui) or in `home` which uses cross-context reads by design.
 
-Folding them into a `codepeek-data` junk-drawer would erase the dependency-isolation and parallel-compilation benefits. Folding them into the binary would block the view layer from depending on their traits via core. Three crates matches the existing pattern (`core` / `git` / `syntax` / `view`).
+### What v3 changes vs v2
 
-We do **not** add a new crate for branches/log. That's git-domain — it extends `codepeek-git`.
+| Concern | v2 | v3 | Why |
+|---|---|---|---|
+| Crate count | 8 (core/git/syntax/view + 3 new) | 8 (same) | Rust notebook's "prefer small crates" still applies |
+| `core` internal shape | Flat: `change.rs`, `diff.rs`, `traits.rs`, `error.rs`, … | Bounded-context modules: `changes/`, `tags/`, `sessions/`, … each with `domain.rs`/`port.rs`/`error.rs`/`app.rs` | Architecture guide: Screaming Architecture + Package by Component |
+| Application layer | None — views call store traits directly | **NEW: use cases per context** (e.g. `AddTagUseCase`, `RefreshChangesUseCase`); views hold `Rc<UseCase>` not `Rc<dyn Store>` | Architecture guide: Application layer between view and domain is mandatory for mutations |
+| Router location | `crates/view/src/router.rs` | `apps/tui/src/router.rs` | Architecture guide: composition root is in the binary, not in a library crate |
+| App + View enum location | `crates/view/src/app.rs`, `views.rs` | `apps/tui/src/app.rs`, `views_enum.rs` | Same reason — the set of views is a composition decision |
+| `view` crate responsibilities | App, Router, Views, chrome | Chrome + per-context View structs (no App, no Router, no View enum) | Clean separation of "what views exist" (binary) from "how views are built" (library) |
+| Milestones | 17 technical phases (Foundation → Storage → Discovery → Git → Sessions → Polish) | **9 vertical slices** aligned to bounded contexts (Shell refactor → Tags → Search → Todos → Branches → Sessions → Home → Palette → Polish) | Architecture guide: prefer vertical slices; milestones deliver complete contexts, not technical layers |
+| `#[non_exhaustive]` | "All types get it" | **Narrowed**: only on open enums (`ChangeKind`, `TagKind`, `TodoKind`, `ActivityKind`) and on `Theme` sub-structs. NOT on Data Objects (`FileChange`, `DiffHunk`, `Tag`, `TodoItem`, `CommitInfo`). | Rust notebook: `#[non_exhaustive]` on Data Objects harms readability by forcing `..` wildcards in callers |
+| `CommitSha` type | `CommitSha(String)` | `CommitSha([u8; 20])` with hex encoding for display | Rust notebook: a Git SHA is exactly 20 bytes; String clones allocate |
+| `SessionId` type | `SessionId(String)` | `SessionId(Rc<str>)` | Rust notebook: variable-length IDs clone frequently in cross-view dispatch; `Rc<str>` makes clone free |
+| Presentation pattern naming | "Component Architecture pattern" (parenthetical) | **Explicitly "Component Architecture, not TEA"** — documented in `docs/decisions.md` and `chrome/action.rs` module doc | Rust notebook: per-view state mutation is a formal departure from TEA and deserves an explicit name |
+| Use-case-vs-store in views | Views hold `Rc<dyn TagStore>` and call methods directly | Views hold `Rc<ListTagsUseCase>`, `Rc<AddTagUseCase>`, etc. Stores are invisible to the view. | Architecture guide: view never touches infra ports for mutations |
+| Pure-read access from views | Same as mutation | **CQRS read-side:** Home's activity aggregator may read port methods directly (via a tiny `read` submodule). Mutations always go through a use case. | Architecture guide: CQRS allows the read side to skip the application layer for performance and simplicity |
 
-### Single-threaded design — `Rc` over `Arc`, no `Send + Sync` bounds
+Everything else from v2 is preserved: enum View with Pattern B exhaustive delegates, LoadState<T> + mpsc background loading, Rc over Arc, RefCell over Mutex, drop Send+Sync from traits, `Box<dyn Error + Send + Sync>` retained inside error sources, `tempfile::NamedTempFile::persist` for atomic JSON writes, `Cow<'_, [(&'static str, &'static str)]>` for status hints, `TICKS_PER_FRAME = 6` for spinner pacing, newtype IDs for compile-time type safety, NewTag<'a> input struct, `#[from]` preferred over `#[source]` for ergonomic `?`.
+
+### Single-threaded design — `Rc` over `Arc`, no `Send + Sync` bounds (preserved from v2)
 
 Codepeek runs a single render+event loop on the main thread. The only multi-threaded code introduced by this plan is **short-lived background worker threads** (see "Background data loading" below). Those workers don't share trait objects with the main thread — they hand back owned `T` values via `mpsc::channel`.
 
 Therefore:
 
-- **Shared store ownership uses `Rc<dyn Trait>`, not `Arc<dyn Trait>`.** Multiple views can hold a clone of the same `Rc<dyn TagStore>` without atomic refcount overhead. (`Box<dyn Trait>` is wrong here because exclusive ownership prevents sharing.)
-- **Interior mutability uses `Rc<RefCell<dyn Trait>>`, not `Arc<Mutex<dyn Trait>>`.** Specifically: `SyntaxHighlighter` takes `&mut self` (tree-sitter requires it) and is held as `Rc<RefCell<dyn SyntaxHighlighter>>`.
+- **Shared use-case ownership uses `Rc<UseCase>`, not `Arc<UseCase>`.** Multiple views can hold a clone of the same `Rc<AddTagUseCase>` without atomic refcount overhead. (`Box<UseCase>` is wrong here because exclusive ownership prevents sharing.)
+- **Use cases internally hold `Rc<dyn Trait>` for their ports.** E.g. `AddTagUseCase { store: Rc<dyn TagStore> }`. Again, not `Arc` — single-threaded.
+- **Interior mutability uses `Rc<RefCell<T>>`, not `Arc<Mutex<T>>`.** Specifically: the `SyntaxHighlighter` adapter takes `&mut self` (tree-sitter requires it) and is held as `Rc<RefCell<dyn SyntaxHighlighter>>`. The `GitChangeDetector` becomes `RefCell<Repository>` internally.
 - **None of the new traits have `: Send + Sync` bounds.** `TagStore`, `SessionStore`, `TodoScanner`, `FileSearcher`, `CommitLog` are all `pub trait Foo { … }` — no thread-safety constraint.
 - **Worker threads consume owned values, not trait objects.** When SessionsView spawns a background scan, the worker is a `move` closure that owns a fresh `ClaudeSessionStore` value (cheap to construct), not a clone of the view's `Rc`. This sidesteps `Send` requirements entirely.
 
-There's one wrinkle: the existing `ChangeDetector` and `SyntaxHighlighter` traits in `codepeek-core` are currently declared `Send + Sync`. Those bounds were added speculatively in the original change-viewer plan. They're harmless today (the `git2::Repository` inside `GitChangeDetector` is wrapped in a `Mutex` to satisfy `Sync`) but they don't pull their weight. **This plan removes those bounds in M2** and replaces the `Mutex` inside `GitChangeDetector` with a `RefCell`. If a future plan needs to ship work to a worker thread, it can construct a fresh detector inside the worker the same way SessionsView does.
+The existing `ChangeDetector` and `SyntaxHighlighter` traits in `core` are currently declared `Send + Sync`. Those bounds were added speculatively in the original change-viewer plan. They're harmless today (the `git2::Repository` inside `GitChangeDetector` is wrapped in a `Mutex` to satisfy `Sync`) but they don't pull their weight. **This plan removes those bounds in M1** and replaces the `Mutex` inside `GitChangeDetector` with a `RefCell`. If a future plan needs to ship work to a worker thread, it can construct a fresh detector inside the worker the same way SessionsView does.
 
-The notebook is explicit on this: Clippy lints `arc_with_non_send_sync`, `rc_mutex`, and `mutex_atomic` all flag the multi-threaded-primitive-in-single-threaded-code anti-pattern. We'd be tripping all three with the v1 design.
+**Independent validation:** the rust-style-guide notebook explicitly endorsed this pattern in the v3 review — Clippy's `arc_with_non_send_sync`, `rc_mutex`, and `mutex_atomic` would all flag the multi-threaded-primitive-in-single-threaded-code anti-pattern. The `move`-owned-data worker pattern "cleanly isolates your single-threaded UI from your asynchronous I/O."
 
-### Static dispatch for views — `enum View`, not `Box<dyn View>`
+### Static dispatch for views — `enum View`, not `Box<dyn View>` (preserved from v2)
 
-The set of top-level views is **closed and known at compile time**: Home, Changes, Sessions, Search, Tags, Branches, Todos, FileViewer (the contextual file-display view). New views require a code change. There's no plugin system, no runtime registration.
+The set of top-level views is **closed and known at compile time**: Home, Changes, Sessions, Search, Tags, Branches, Todos, FileViewer. New views require a code change. There's no plugin system, no runtime registration.
 
 For closed sets, the idiomatic Rust choice is an enum, not a trait object:
 
@@ -127,25 +407,23 @@ pub enum View {
 
 Benefits over `Box<dyn View>`:
 
-- **Exhaustive matches.** The compiler forces every match on `View` to handle every variant — when we add a future `Pins` view, the compiler tells us exactly which match arms need updating. (Aligns with the Rust style guide's "Prefer exhaustive matches" rule.)
-- **No heap allocation on navigation.** Each view enum carries its concrete type inline; navigation is `self.current = View::Sessions(SessionsView::new(…))`, no `Box::new`.
-- **Compiler inlining.** `match` over an enum lets the compiler inline render and update logic per-variant. Trait object dispatch goes through a vtable.
-- **No object-safety constraints.** We can have associated constants, generic methods, etc. on individual View variants without worrying about whether the trait is dyn-compatible.
+- **Exhaustive matches.** The compiler forces every match on `View` to handle every variant. (Aligns with the Rust style guide's "Prefer exhaustive matches" rule.)
+- **No heap allocation on navigation.** Each variant carries its concrete type inline; navigation is `self.current = View::Sessions(SessionsView::new(…))`, no `Box::new`.
+- **Compiler inlining.** `match` over an enum lets the compiler inline render/update logic per-variant.
+- **No object-safety constraints.** Associated constants, generic methods, etc. are available on individual variant types.
 
-The cost is that the enum file lists every variant (small) and every method delegates via `match` (boilerplate). For seven variants and seven methods this is ~50 lines of plumbing in `views.rs`. The `enum_dispatch` crate exists to generate this automatically; we don't use it for v1 because the manual `match` is clear and adds no dependency.
+The cost is the `views_enum.rs` file in `apps/tui` with one line per variant per delegate method. See "Delegate pattern: exhaustive match per variant, no wildcards" below for why v3 still uses Pattern B.
 
-The notebook noted that `Box<dyn View>` is *acceptable* for ~6 top-level views — vtable lookups are nanoseconds and the Component Architecture is friendly to dynamic dispatch — so this is a "more idiomatic" call, not a "fixing a bug" call.
+**v3 placement note:** the `View` enum lives in `apps/tui/src/views_enum.rs`, not in `crates/view`. Rationale: the set of views is a composition decision (which views exist, which use cases each view needs) that belongs in the composition root. The per-context view *structs* (`HomeView`, `ChangesView`, …) still live in `crates/view/src/views/*.rs`; the enum that aggregates them lives in the binary that decides which set of views to assemble.
 
-**In contrast:** the injected stores (`TagStore`, `SessionStore`, etc.) are still `Rc<dyn Trait>`. The store set really is open — a test stub, a JSON impl, a hypothetical future SQLite impl all need to coexist. Trait objects are right for that side of the boundary.
-
-### Background data loading — `mpsc` channels and worker threads
+### Background data loading — `mpsc` channels and worker threads (preserved from v2)
 
 Walking 100+ session JSONL files, scanning a workdir for TODO comments, or asking `git2` for the recent commit log can each take 100–500ms on a real repo. The render loop has a 16ms budget per frame (for 60fps); blocking on these calls inside `View::on_enter` would freeze the UI.
 
 **The pattern:** every view that does I/O has a `LoadState<T>` field rather than holding `T` directly:
 
 ```rust
-// crates/view/src/loading.rs
+// crates/view/src/chrome/loading.rs
 pub enum LoadState<T> {
     /// View was just constructed; no load attempted yet.
     Idle,
@@ -163,119 +441,704 @@ pub enum LoadState<T> {
 
 **Lifecycle:**
 
-1. `View::on_enter` is called when the user navigates to the view. It transitions `LoadState::Idle` → `LoadState::Loading { rx }` and `std::thread::spawn`s a worker that owns whatever it needs (a fresh store value, or a `Sender` clone). The worker calls the slow API and sends back a `Result<T, String>` over the channel.
-2. The main loop calls `View::poll_loading(&mut self)` once per tick (between `draw` and `handle_events`). `poll_loading` does a non-blocking `rx.try_recv()`. If a result has arrived, transition to `Ready(t)` or `Failed(msg)`. If still pending, increment `spinner_tick` so the spinner animates.
-3. `View::render` checks `LoadState`:
-   - `Idle` → render an empty placeholder ("Press `r` to load" or auto-trigger from `on_enter`)
-   - `Loading` → render a centered spinner with view title
-   - `Ready(t)` → render normally using `t`
-   - `Failed(msg)` → render via `ErrorBar`
+1. `View::on_enter` is called when the user navigates to the view. It transitions `Idle → Loading { rx }` and `std::thread::spawn`s a worker that owns whatever it needs.
+2. The App run loop calls `View::poll_loading(&mut self)` once per tick (between `draw` and `handle_events`). `poll_loading` does a non-blocking `rx.try_recv()`. If a result has arrived, transition to `Ready(t)` or `Failed(msg)`. If still pending, increment `spinner_tick` so the spinner animates.
+3. `View::render` checks `LoadState` and renders the appropriate state.
 
 **Why `std::thread::spawn` and not `tokio::spawn`?**
-
 - No new dependency, no runtime to set up
 - The work is one-shot per view enter, not a long-lived async task
 - The worker only needs to send one message back; we don't need futures composition
 - `std::sync::mpsc::Receiver::try_recv` is exactly the non-blocking poll we need
 - Adding `tokio` would force every other crate's traits into `async fn` and balloon the plan
 
-**Worker code shape (illustrative):**
+**v3 note on the application layer:** the use cases sit between views and workers. A view's `on_enter` calls a use case synchronously on the worker thread:
 
 ```rust
-// inside SessionsView::on_enter
+// Inside SessionsView::on_enter (simplified)
 let (tx, rx) = mpsc::channel();
 let repo = self.repo_root.clone();
+let use_case = self.list_use_case.clone();  // Rc<ListRepoSessionsUseCase> — NOT Send
 std::thread::spawn(move || {
-    let result = ClaudeSessionStore::discover()
-        .and_then(|store| store.list_sessions(&repo))
+    // Can't send the Rc<UseCase> into the worker because Rc is !Send.
+    // Instead, the worker constructs a fresh ClaudeSessionStore and wraps it
+    // in a fresh use case that lives entirely on the worker thread.
+    let store = ClaudeSessionStore::discover();
+    let result = store
+        .and_then(|s| ListRepoSessionsUseCase::new(Rc::new(s)).execute(&repo))
         .map_err(|e| e.to_string());
-    let _ = tx.send(result);  // ignore SendError if view was dropped
+    let _ = tx.send(result);
 });
 self.state = LoadState::Loading { rx, spinner_tick: 0 };
 ```
 
-The worker constructs a fresh `ClaudeSessionStore` rather than cloning the view's `Rc<dyn SessionStore>` — this avoids needing `Send` on the trait. For each view, the constructor is cheap (just resolves a path and returns a struct).
-
-**App-level glue:**
-
-```rust
-// in App::run
-while !self.should_quit {
-    self.current.poll_loading();           // drain background results
-    terminal.draw(|frame| self.render(frame))?;
-    self.handle_events()?;                  // poll(16ms) for keys
-}
-```
-
-The 16ms event poll naturally limits us to ~60fps. Spinner animation is driven by `spinner_tick`, which increments every time `poll_loading` runs (on every tick). The `Spinner::frame()` helper divides this raw tick count by `TICKS_PER_FRAME` (6) to produce a ~10fps animation — see "Spinner rendering" below. No sleeps, no separate timer thread.
+This works because:
+- The worker constructs owned, thread-local `Rc`s that never cross the thread boundary
+- The worker computes a `Result<Vec<SessionInfo>, String>` and sends only owned data back
+- Neither `Rc<UseCase>` nor `Rc<dyn SessionStore>` is required to be `Send`
+- The same pattern applies to every slow view (Sessions, Todos, Search, Branches)
 
 **Trade-offs we're accepting:**
-
-- **No streaming results.** A worker either returns the whole `Vec<SessionInfo>` or fails. Partial results during a slow scan would require a more complex channel protocol — out of scope.
-- **No cancellation.** If the user navigates away while a worker is still running, the worker finishes and drops its message into a channel that nobody is reading. Worker is short-lived, so the wasted CPU is a few hundred ms in the worst case. Cancellation is its own future plan.
-- **One worker per view at a time.** If the user mashes `r` to refresh, we don't queue extra workers — we either ignore the refresh while a load is in flight, or replace the receiver. Decision: ignore extras (return early in `on_enter` if `LoadState::Loading`).
+- **No streaming results.** A worker either returns the whole `Vec` or fails.
+- **No cancellation.** If the user navigates away, the worker finishes and drops its message into a disconnected channel.
+- **One worker per view at a time.** If the user mashes `r`, we don't queue extra workers — we return early if `LoadState::Loading`.
 
 ---
 
-## Core crate extensions (`codepeek-core`)
+## Shared Kernel (`crates/core/src/kernel/`)
 
-### Newtype IDs
-
-Per the *Rust Design Patterns* book §3.1.3, primitive ID fields are wrapped in newtypes for compile-time type safety. Zero runtime overhead — the compiler optimizes away the wrapper.
+The minimal set of types that cross context boundaries. The rule: if you find yourself wanting to add something to `kernel`, first ask whether it belongs in exactly ONE context instead.
 
 ```rust
-// id.rs
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
-pub struct TagId(pub u64);
+// crates/core/src/kernel/highlight.rs
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum HighlightKind {
+    Keyword, Function, Type, String, Comment, Number,
+    Operator, Variable, Punctuation, Constant, Property,
+    Tag, Attribute,
+}
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
-pub struct SessionId(pub String);
+// Data Object — NO #[non_exhaustive]. Every view pattern-matches on this.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HighlightSpan { pub start: usize, pub end: usize, pub kind: HighlightKind }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
-pub struct CommitSha(pub String);
+#[derive(Debug, Clone)]
+pub struct HighlightedLine { pub content: String, pub spans: Vec<HighlightSpan> }
+```
 
-impl CommitSha {
-    /// First 7 chars for display.
-    pub fn short(&self) -> &str {
-        let len = self.0.len().min(7);
-        &self.0[..len]
+```rust
+// crates/core/src/kernel/activity.rs
+use std::path::PathBuf;
+use std::time::SystemTime;
+use crate::branches::domain::CommitSha;   // wait — this would be a cross-context import!
+use crate::tags::domain::TagId;
+use crate::sessions::domain::SessionId;
+
+// ActivityEntry must reference IDs from multiple bounded contexts. 
+// Two design choices:
+//
+// (a) Use the concrete ID newtypes from each context as fields.
+//     Pros: type-safe, zero-cost, matches exactly what Home needs.
+//     Cons: kernel imports from context modules — inverts the layering.
+//     Workaround: declare ActivityEntry INSIDE the context where it's 
+//     "owned" (home). But home isn't its own crate in v3 — it's a view 
+//     in view/views/home.rs, which can import every context freely.
+//
+// (b) Use opaque ID strings (ActivityTarget::Commit(String)).
+//     Pros: kernel depends on nothing.
+//     Cons: loses type safety at the exact boundary where Home dispatches
+//     to another view; the dispatch code has to parse the opaque string.
+//
+// v3 chooses (a) but moves ActivityEntry OUT of the kernel and into 
+// crates/view/src/views/home.rs. The kernel is not the right place for a 
+// type that imports from every bounded context.
+```
+
+**Revision:** `ActivityEntry`, `ActivityKind`, `ActivityTarget` do **NOT** live in the Shared Kernel. They live in `crates/view/src/views/home.rs` because `home` is the one view that's allowed to know about every context. Moving them to kernel would invert the layering (kernel importing from contexts).
+
+So the Shared Kernel shrinks to just:
+
+```rust
+// crates/core/src/kernel/mod.rs
+pub mod highlight;
+pub use highlight::{HighlightKind, HighlightSpan, HighlightedLine};
+```
+
+And the syntax port lives one level up, in its own module:
+
+```rust
+// crates/core/src/syntax/mod.rs
+pub mod port;
+pub mod error;
+pub use port::SyntaxHighlighter;
+pub use error::SyntaxError;
+```
+
+```rust
+// crates/core/src/syntax/port.rs
+use std::path::Path;
+use crate::kernel::HighlightedLine;
+use crate::syntax::error::SyntaxError;
+
+pub trait SyntaxHighlighter {
+    fn highlight(&mut self, source: &str, path: &Path)
+        -> Result<Vec<HighlightedLine>, SyntaxError>;
+}
+```
+
+Note no `Send + Sync` bound (v2 decision preserved, v3 confirmed).
+
+---
+
+## Bounded context: `changes`
+
+### Domain (`crates/core/src/changes/domain.rs`)
+
+```rust
+use std::path::PathBuf;
+use std::time::SystemTime;
+
+// Data Object — NO #[non_exhaustive]. Views match all fields.
+#[derive(Debug, Clone)]
+pub struct FileChange {
+    pub path: PathBuf,
+    pub kind: ChangeKind,
+    pub mtime: SystemTime,
+}
+
+// Open enum — YES #[non_exhaustive]. Adding Untracked later should not break callers.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChangeKind {
+    Added,
+    Modified,
+    Deleted,
+    Renamed { from: PathBuf },
+    Unchanged,
+}
+
+// Data Objects — NO #[non_exhaustive]. 
+#[derive(Debug, Clone)]
+pub struct DiffHunk {
+    pub old_start: u32,
+    pub old_lines: u32,
+    pub new_start: u32,
+    pub new_lines: u32,
+    pub lines: Vec<DiffLine>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DiffLine {
+    pub kind: LineChange,
+    pub content: String,
+    pub old_lineno: Option<u32>,
+    pub new_lineno: Option<u32>,
+}
+
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LineChange { Added, Removed, Modified }
+
+#[derive(Debug, Clone, Default)]
+pub struct ChangeMap {
+    pub added: std::collections::HashSet<u32>,
+    pub modified: std::collections::HashSet<u32>,
+    pub deleted: Vec<u32>,
+}
+```
+
+### Port (`crates/core/src/changes/port.rs`)
+
+```rust
+use std::path::Path;
+use crate::changes::domain::{FileChange, DiffHunk};
+use crate::changes::error::ChangeError;
+
+pub trait ChangeDetector {
+    fn detect_changes(&self) -> Result<Vec<FileChange>, ChangeError>;
+    fn compute_diff(&self, path: &Path) -> Result<Vec<DiffHunk>, ChangeError>;
+    fn read_at_head(&self, path: &Path) -> Result<String, ChangeError>;
+}
+```
+
+No `Send + Sync` bound.
+
+### Error (`crates/core/src/changes/error.rs`)
+
+```rust
+use std::path::PathBuf;
+
+#[derive(Debug, thiserror::Error)]
+pub enum ChangeError {
+    #[error("repository not found at {path}")]
+    RepoNotFound { path: PathBuf },
+
+    #[error("failed to read file status")]
+    StatusFailed(#[source] Box<dyn std::error::Error + Send + Sync>),
+
+    #[error("failed to compute diff for {path}")]
+    DiffFailed {
+        path: PathBuf,
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[error("file not found at HEAD: {path}")]
+    FileNotInHead { path: PathBuf },
+}
+```
+
+`Box<dyn Error + Send + Sync>` bounds are retained per v2 (confirmed by v3 rust review). The bound is free (every wrapped type is `Send + Sync` already) and future-proofs error propagation through `mpsc::channel`.
+
+### Use cases (`crates/core/src/changes/app.rs`)
+
+```rust
+use std::path::{Path, PathBuf};
+use std::rc::Rc;
+use std::cell::RefCell;
+
+use crate::changes::domain::{FileChange, ChangeKind, DiffHunk, ChangeMap};
+use crate::changes::port::ChangeDetector;
+use crate::changes::error::ChangeError;
+use crate::kernel::HighlightedLine;
+use crate::syntax::{SyntaxHighlighter, SyntaxError};
+
+/// DTO returned by OpenChangedFileUseCase — the exact shape the view needs.
+#[derive(Debug)]
+pub struct OpenedFile {
+    pub path: PathBuf,
+    pub lines: Vec<HighlightedLine>,
+    pub change_map: ChangeMap,
+    pub diff_hunks: Vec<DiffHunk>,
+}
+
+/// Refresh the list of file changes. Pure read — no side effects.
+pub struct RefreshChangesUseCase {
+    detector: Rc<dyn ChangeDetector>,
+}
+
+impl RefreshChangesUseCase {
+    pub fn new(detector: Rc<dyn ChangeDetector>) -> Self { Self { detector } }
+
+    pub fn execute(&self) -> Result<Vec<FileChange>, ChangeError> {
+        self.detector.detect_changes()
+    }
+}
+
+/// Open a changed file: read bytes, highlight, compute diff, assemble DTO.
+///
+/// This orchestrates three operations that the view would otherwise have
+/// to coordinate. Moving it here means the view just renders the DTO.
+pub struct OpenChangedFileUseCase {
+    detector: Rc<dyn ChangeDetector>,
+    highlighter: Rc<RefCell<dyn SyntaxHighlighter>>,
+}
+
+impl OpenChangedFileUseCase {
+    pub fn new(
+        detector: Rc<dyn ChangeDetector>,
+        highlighter: Rc<RefCell<dyn SyntaxHighlighter>>,
+    ) -> Self {
+        Self { detector, highlighter }
+    }
+
+    pub fn execute(&self, path: &Path, kind: &ChangeKind) -> Result<OpenedFile, ChangeError> {
+        // 1. Read bytes (this is where binary detection would live; we let the
+        //    view still do that because it decides how to render binary content)
+        // 2. Highlight via self.highlighter.borrow_mut().highlight(...)
+        // 3. Compute diff hunks
+        // 4. Build ChangeMap from hunks; if Added, mark every line as added
+        // 5. Return OpenedFile DTO
+        //
+        // The binary-content check stays in the view layer in v3 because it's 
+        // about *how to render*, not *what the content means*. A future refactor 
+        // could move it here as an OpenedFile::Binary variant.
+        todo!()  // filled in during M2
+    }
+}
+
+/// Read a deleted file's content at HEAD, highlighted, for the peek overlay.
+pub struct PeekDeletedFileUseCase {
+    detector: Rc<dyn ChangeDetector>,
+    highlighter: Rc<RefCell<dyn SyntaxHighlighter>>,
+}
+
+impl PeekDeletedFileUseCase {
+    pub fn new(
+        detector: Rc<dyn ChangeDetector>,
+        highlighter: Rc<RefCell<dyn SyntaxHighlighter>>,
+    ) -> Self {
+        Self { detector, highlighter }
+    }
+
+    pub fn execute(&self, path: &Path) -> Result<Vec<HighlightedLine>, ChangeError> {
+        let content = self.detector.read_at_head(path)?;
+        let highlighted = self
+            .highlighter
+            .borrow_mut()
+            .highlight(&content, path)
+            .unwrap_or_else(|_| {
+                // Fallback: render raw lines with no syntax highlighting
+                content
+                    .lines()
+                    .map(|l| HighlightedLine { content: l.to_string(), spans: vec![] })
+                    .collect()
+            });
+        Ok(highlighted)
     }
 }
 ```
 
-**Note on `serde` in core:** the core crate already takes the `serde` workspace dep transitively (the existing `apps/tui/src/config.rs` uses it via `serde::Deserialize`). Core itself currently has no `serde` dep. **In M2 we add `serde = { workspace = true, features = ["derive"] }` to `crates/core/Cargo.toml`.** This is a small concession — core no longer has zero deps — but it's the right call because every persisted/transmitted ID needs to round-trip JSON. The alternative (newtypes in a separate crate) is over-engineered.
+Note the use case's `new` functions take `Rc<dyn Trait>` — they're dependency-injected by the composition root. The view takes `Rc<OpenChangedFileUseCase>`, which is strictly more specific than `Rc<dyn ChangeDetector>`.
 
-### New domain types
+### View struct (`crates/view/src/views/changes.rs`)
 
 ```rust
-// activity.rs — cross-source recent activity
-pub enum ActivityKind {
-    FileEdit,
-    Commit,
-    Session,
-    Tag,
-    Todo,
+use std::rc::Rc;
+use codepeek_core::changes::app::{
+    RefreshChangesUseCase, OpenChangedFileUseCase, PeekDeletedFileUseCase
+};
+
+pub struct ChangesView {
+    refresh_use_case: Rc<RefreshChangesUseCase>,
+    open_use_case: Rc<OpenChangedFileUseCase>,
+    peek_use_case: Rc<PeekDeletedFileUseCase>,
+    file_list: crate::chrome::components::FileList,
+    file_viewer: crate::chrome::components::FileViewer,
+    peek_overlay: Option<crate::chrome::components::PeekOverlay>,
+    focus: Focus,       // FileList | FileViewer — local private state
+    error_message: Option<String>,
 }
 
-pub struct ActivityEntry {
-    pub kind: ActivityKind,
-    pub when: SystemTime,
-    pub label: String,            // "edited file_viewer.rs", "Claude session: refactor"
-    pub target: ActivityTarget,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Focus { FileList, FileViewer }
+```
+
+The view holds three `Rc<UseCase>` clones, not raw store traits. The view is completely ignorant of git2.
+
+### Adapter (`crates/git/src/detector.rs`)
+
+`GitChangeDetector` implements both `ChangeDetector` and `CommitLog` (the branches-context port). This is the one adapter that's allowed to know two bounded contexts — it's specifically the git2 binding that exposes git-backed behaviors to both.
+
+```rust
+use std::cell::RefCell;
+use git2::Repository;
+
+use codepeek_core::changes::port::ChangeDetector;
+use codepeek_core::changes::domain::{FileChange, DiffHunk, /* … */};
+use codepeek_core::changes::error::ChangeError;
+use codepeek_core::branches::port::CommitLog;
+use codepeek_core::branches::domain::{CommitInfo, BranchInfo, CommitSha};
+use codepeek_core::branches::error::BranchError;
+
+pub struct GitChangeDetector { repo: RefCell<Repository> }
+
+impl GitChangeDetector {
+    pub fn open(path: &Path) -> Result<Self, ChangeError> {
+        let repo = Repository::discover(path)
+            .map_err(|_| ChangeError::RepoNotFound { path: path.to_path_buf() })?;
+        Ok(Self { repo: RefCell::new(repo) })
+    }
 }
 
-pub enum ActivityTarget {
-    File { path: PathBuf },
-    Commit { sha: CommitSha },
-    Session { id: SessionId },
-    Tag { id: TagId },
-    Todo { path: PathBuf, line: u32 },
-    None,
+impl ChangeDetector for GitChangeDetector { /* … */ }
+impl CommitLog for GitChangeDetector { /* … */ }
+```
+
+One struct, two traits, one allocation. The binary coerces the same `Rc<GitChangeDetector>` to both trait objects.
+
+---
+
+## Bounded context: `tags`
+
+### Domain (`crates/core/src/tags/domain.rs`)
+
+```rust
+use std::path::{Path, PathBuf};
+use std::time::SystemTime;
+
+// Opaque ID newtype — serialized as u64 in JSON.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct TagId(pub u64);
+
+// Open enum — adding TagKind::Note later should not be breaking.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum TagKind { Issue, Fix }
+
+// Data Object — NO #[non_exhaustive].
+#[derive(Debug, Clone)]
+pub struct Tag {
+    pub id: TagId,
+    pub created_at: SystemTime,
+    pub path: PathBuf,
+    pub line: u32,
+    pub kind: TagKind,
+    pub note: String,
+}
+
+// Input struct — stable signature for TagStore::add_tag.
+pub struct NewTag<'a> {
+    pub path: &'a Path,
+    pub line: u32,
+    pub kind: TagKind,
+    pub note: &'a str,
 }
 ```
 
+### Port (`crates/core/src/tags/port.rs`)
+
 ```rust
-// session.rs
+use crate::tags::domain::{Tag, TagId, NewTag};
+use crate::tags::error::TagError;
+
+pub trait TagStore {
+    fn list_tags(&self) -> Result<Vec<Tag>, TagError>;
+    fn add_tag(&self, new: NewTag<'_>) -> Result<Tag, TagError>;
+    fn remove_tag(&self, id: TagId) -> Result<(), TagError>;
+}
+```
+
+### Error (`crates/core/src/tags/error.rs`)
+
+```rust
+use std::path::PathBuf;
+
+#[derive(Debug, thiserror::Error)]
+pub enum TagError {
+    #[error("tag store path resolution failed")]
+    NoConfigDir,
+
+    #[error("failed to read tag store at {path}")]
+    ReadFailed {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("failed to write tag store at {path}")]
+    WriteFailed {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("tag store data is corrupt: {message}")]
+    Corrupt { message: String },
+
+    #[error("tag {id} not found")]
+    NotFound { id: u64 },
+}
+```
+
+(The old `StoreError` is renamed `TagError` because it's scoped to the tags context. If a future context needs its own store, it gets its own error type — no shared StoreError.)
+
+### Use cases (`crates/core/src/tags/app.rs`)
+
+```rust
+use std::rc::Rc;
+
+use crate::tags::domain::{Tag, TagId, NewTag};
+use crate::tags::port::TagStore;
+use crate::tags::error::TagError;
+
+pub struct AddTagUseCase { store: Rc<dyn TagStore> }
+
+impl AddTagUseCase {
+    pub fn new(store: Rc<dyn TagStore>) -> Self { Self { store } }
+
+    pub fn execute(&self, new: NewTag<'_>) -> Result<Tag, TagError> {
+        // v1: forward to the store directly.
+        // Future: emit a domain event, update an index, validate note length,
+        // enforce per-file tag limits, etc.
+        self.store.add_tag(new)
+    }
+}
+
+pub struct ListTagsUseCase { store: Rc<dyn TagStore> }
+
+impl ListTagsUseCase {
+    pub fn new(store: Rc<dyn TagStore>) -> Self { Self { store } }
+
+    pub fn execute(&self) -> Result<Vec<Tag>, TagError> {
+        self.store.list_tags()
+    }
+}
+
+pub struct RemoveTagUseCase { store: Rc<dyn TagStore> }
+
+impl RemoveTagUseCase {
+    pub fn new(store: Rc<dyn TagStore>) -> Self { Self { store } }
+
+    pub fn execute(&self, id: TagId) -> Result<(), TagError> {
+        self.store.remove_tag(id)
+    }
+}
+```
+
+Three tiny use cases per mutation/query. Each is trivial in v1 — but the indirection exists specifically so that future changes (validation, events, indexing, rate limiting) don't require touching any view. This is the architecture guide's point about the application layer being the orchestration seam.
+
+### View struct (`crates/view/src/views/tags.rs`)
+
+```rust
+use std::rc::Rc;
+use codepeek_core::tags::app::{ListTagsUseCase, RemoveTagUseCase};
+use codepeek_core::tags::domain::Tag;
+
+use crate::chrome::loading::LoadState;
+
+pub struct TagsView {
+    list_use_case: Rc<ListTagsUseCase>,
+    remove_use_case: Rc<RemoveTagUseCase>,
+    state: LoadState<Vec<Tag>>,
+    selected: usize,
+    error_message: Option<String>,
+}
+```
+
+`FileViewerView` also holds `Rc<AddTagUseCase>` so pressing `m` while viewing a file adds a tag without going through a global Action. That's the Component Architecture in action.
+
+### Adapter (`crates/store/src/json_tag_store.rs`)
+
+```rust
+use std::cell::RefCell;
+use std::path::PathBuf;
+
+use codepeek_core::tags::port::TagStore;
+use codepeek_core::tags::domain::{Tag, TagId, NewTag};
+use codepeek_core::tags::error::TagError;
+
+pub struct JsonTagStore {
+    path: PathBuf,
+    inner: RefCell<TagFile>,
+}
+
+struct TagFile {
+    version: u32,
+    next_id: u64,
+    tags: Vec<Tag>,
+}
+
+impl JsonTagStore {
+    pub fn open() -> Result<Self, TagError> { /* resolve, load, or init */ }
+}
+
+impl TagStore for JsonTagStore {
+    fn list_tags(&self) -> Result<Vec<Tag>, TagError> {
+        Ok(self.inner.borrow().tags.clone())
+    }
+
+    fn add_tag(&self, new: NewTag<'_>) -> Result<Tag, TagError> { /* … */ }
+    fn remove_tag(&self, id: TagId) -> Result<(), TagError> { /* … */ }
+}
+
+impl JsonTagStore {
+    fn persist(&self, inner: &TagFile) -> Result<(), TagError> {
+        // 1. Serialize inner to JSON string
+        // 2. Resolve parent dir of self.path; create if missing
+        // 3. let temp = tempfile::NamedTempFile::new_in(parent)?;
+        // 4. Write JSON bytes via temp.as_file().write_all(...)?;
+        // 5. temp.persist(&self.path)?;   // atomic rename
+        todo!()
+    }
+}
+```
+
+**Atomic write via `tempfile`** is preserved from v2. Crash safety, race safety, less code to test.
+
+---
+
+## Bounded context: `branches`
+
+### Domain (`crates/core/src/branches/domain.rs`)
+
+```rust
+use std::fmt;
+use std::time::SystemTime;
+
+/// A Git SHA is exactly 20 bytes (SHA-1). Storing it as a fixed byte array
+/// eliminates heap allocation on every clone.
+///
+/// Serialization goes through hex encoding so the on-disk/wire format is
+/// still a 40-character ASCII string, matching what users see in `git log`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CommitSha([u8; 20]);
+
+impl CommitSha {
+    pub fn from_bytes(bytes: [u8; 20]) -> Self { Self(bytes) }
+
+    pub fn from_hex(hex: &str) -> Result<Self, &'static str> {
+        if hex.len() != 40 {
+            return Err("git sha must be 40 hex chars");
+        }
+        let mut bytes = [0u8; 20];
+        for i in 0..20 {
+            bytes[i] = u8::from_str_radix(&hex[i*2..i*2+2], 16)
+                .map_err(|_| "invalid hex char in git sha")?;
+        }
+        Ok(Self(bytes))
+    }
+
+    pub fn to_hex(&self) -> String {
+        self.0.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// First 7 chars of hex for display.
+    pub fn short(&self) -> String {
+        self.0[..4].iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+            .chars().take(7).collect()
+    }
+}
+
+impl fmt::Display for CommitSha {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.to_hex())
+    }
+}
+
+impl serde::Serialize for CommitSha {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&self.to_hex())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for CommitSha {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        CommitSha::from_hex(&s).map_err(serde::de::Error::custom)
+    }
+}
+
+// Data Object.
+#[derive(Debug, Clone)]
+pub struct CommitInfo {
+    pub sha: CommitSha,
+    pub author: String,
+    pub when: SystemTime,
+    pub summary: String,
+}
+
+// Data Object.
+#[derive(Debug, Clone)]
+pub struct BranchInfo {
+    pub name: String,
+    pub is_current: bool,
+    pub upstream: Option<String>,
+    pub head_sha: CommitSha,
+}
+```
+
+The `CommitSha([u8; 20])` design is **a v3 correction from v2's `String`**. Every `Action::OpenCommit(sha)` dispatch now copies 20 bytes on the stack instead of allocating on the heap.
+
+### Port, error, use cases
+
+(Same shape as the tags context, omitted for brevity. See Milestone G below.)
+
+---
+
+## Bounded context: `sessions`
+
+### Domain (`crates/core/src/sessions/domain.rs`)
+
+```rust
+use std::path::PathBuf;
+use std::rc::Rc;
+use std::time::SystemTime;
+
+/// Claude Code session IDs are UUID-formatted strings of variable length.
+/// Stored as Rc<str> so cloning into Actions and LoadState is free.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct SessionId(pub Rc<str>);
+
+impl SessionId {
+    pub fn new(s: impl Into<Rc<str>>) -> Self { Self(s.into()) }
+    pub fn as_str(&self) -> &str { &self.0 }
+}
+
+// Data Object.
+#[derive(Debug, Clone)]
 pub struct SessionInfo {
     pub id: SessionId,
     pub started_at: SystemTime,
@@ -286,542 +1149,115 @@ pub struct SessionInfo {
 }
 ```
 
-```rust
-// tag.rs
-pub struct Tag {
-    pub id: TagId,
-    pub created_at: SystemTime,
-    pub path: PathBuf,
-    pub line: u32,
-    pub kind: TagKind,
-    pub note: String,
-}
+`SessionId` uses `Rc<str>` — a **v3 refinement from v2's `String`**. Per the Rust notebook: variable-length IDs that cross many boundaries should be reference-counted, not cloned string-by-string. `Rc<str>` clone is essentially a refcount bump.
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum TagKind { Issue, Fix }
+**Concurrency caveat:** `Rc` is `!Send`. Since we pass `SessionId` through `Action::OpenSession(id)` on the main thread and through the `mpsc::channel` from a worker back to the main thread, a worker that needs to *return* a `SessionId` cannot use `Rc<str>` directly — it would need to send a `String` back and have the main thread wrap it in `Rc<str>` on receipt. v3 pattern: `SessionInfo` in the worker uses `SessionId(Rc<str>)` but the worker's `Result<Vec<SessionInfo>, …>` is received on the main thread after the worker has returned, at which point the `Rc` is valid because the worker's thread has ended and the ownership has moved. **This works because `mpsc::channel` transfers ownership of the `Vec<SessionInfo>` across the thread boundary via `send(T)` where `T: Send`.** But `Vec<SessionInfo>` is only `Send` if `SessionInfo` is `Send`, which it isn't if it contains `Rc<str>`. So we need to construct sessions with `Arc<str>` in the worker and convert to `Rc<str>` on receipt, or use `String` throughout.
 
-/// Input shape for `TagStore::add_tag`. Grouped into a struct so the trait
-/// signature is stable as Tag fields evolve (priority, color, etc.).
-pub struct NewTag<'a> {
-    pub path: &'a Path,
-    pub line: u32,
-    pub kind: TagKind,
-    pub note: &'a str,
-}
-```
+**v3 decision:** use `String` for `SessionId` inside the worker and wrap into `Rc<str>` only when the main thread receives the `Vec<SessionInfo>` and is ready to dispatch through `Action::OpenSession(SessionId)`. But that's ugly — the worker has to know about two types. Simpler: **`SessionId` is `Rc<str>` and we never cross-thread `SessionInfo` directly**. Instead, the worker sends `Vec<RawSessionInfo>` where `RawSessionInfo` uses `String`, and the main thread's `View::poll_loading` converts `Vec<RawSessionInfo> → Vec<SessionInfo>`. One mapping pass on receive, O(n) with n tiny, acceptable.
 
-```rust
-// todo.rs
-pub struct TodoItem {
-    pub path: PathBuf,
-    pub line: u32,
-    pub kind: TodoKind,
-    pub text: String,
-}
+Alternative considered and rejected: `SessionId(Arc<str>)`. Works across threads but requires atomic refcount ops. In a single-threaded UI this is wasted work. The `Rc` + receive-side conversion wins on hot-path cost.
 
-pub enum TodoKind { Todo, Fixme, Hack, Xxx }
-```
+**Final v3 answer:** inside `crates/core/src/sessions/domain.rs` we expose both:
+- `RawSessionInfo` — cross-thread shape (`String` for id, `String` for cwd), `Send`
+- `SessionInfo` — main-thread shape (`Rc<str>` for id), `!Send`
+- `impl From<RawSessionInfo> for SessionInfo`
 
-```rust
-// commit.rs
-pub struct CommitInfo {
-    pub sha: CommitSha,            // newtype
-    pub author: String,
-    pub when: SystemTime,
-    pub summary: String,
-}
+The worker produces `Vec<RawSessionInfo>`, sends via mpsc, main thread converts. One O(n) mapping pass on receive. Clean.
 
-pub struct BranchInfo {
-    pub name: String,
-    pub is_current: bool,
-    pub upstream: Option<String>,
-    pub head_sha: CommitSha,
-}
-```
-
-All types get `#[non_exhaustive]` (matching the existing theme structs) so adding fields later isn't a breaking change.
-
-### New traits — no `Send + Sync`
-
-```rust
-// traits.rs (additions)
-
-pub trait SessionStore {
-    fn list_sessions(&self, repo: &Path) -> Result<Vec<SessionInfo>, SessionError>;
-}
-
-pub trait TagStore {
-    fn list_tags(&self) -> Result<Vec<Tag>, StoreError>;
-    fn add_tag(&self, new: NewTag<'_>) -> Result<Tag, StoreError>;
-    fn remove_tag(&self, id: TagId) -> Result<(), StoreError>;
-}
-
-pub trait TodoScanner {
-    fn scan(&self, root: &Path) -> Result<Vec<TodoItem>, SearchError>;
-}
-
-pub trait FileSearcher {
-    /// Fuzzy-match against tracked file paths under `root`.
-    fn find_files(&self, root: &Path, query: &str, limit: usize)
-        -> Result<Vec<PathBuf>, SearchError>;
-}
-
-pub trait CommitLog {
-    fn recent_commits(&self, limit: usize) -> Result<Vec<CommitInfo>, ChangeError>;
-    fn list_branches(&self) -> Result<Vec<BranchInfo>, ChangeError>;
-    fn read_at_commit(&self, sha: &CommitSha, path: &Path) -> Result<String, ChangeError>;
-}
-```
-
-`add_tag` takes `NewTag<'_>` (a borrowed input struct) instead of four positional arguments. Future fields (priority, assignee, color) are added to `NewTag` without breaking the trait signature.
-
-`list_tags` returns `Vec<Tag>` (not `impl Iterator`). The notebook flagged that iterator returns across trait boundaries entangle lifetimes with backing resources — `Vec` is the right call for a clean trait API.
-
-### Removing `Send + Sync` from existing traits
-
-In M2 (after adding the new types but before any view work) we update `crates/core/src/traits.rs`:
-
-```rust
-// Before
-pub trait ChangeDetector: Send + Sync { … }
-pub trait SyntaxHighlighter: Send + Sync { … }
-
-// After
-pub trait ChangeDetector { … }
-pub trait SyntaxHighlighter { … }
-```
-
-And in `crates/git/src/detector.rs`:
-
-```rust
-// Before
-pub struct GitChangeDetector { repo: Mutex<Repository> }
-
-// After
-pub struct GitChangeDetector { repo: RefCell<Repository> }
-```
-
-The `repo` field becomes `RefCell<Repository>` because `git2::Repository` is `!Sync` but we still need interior mutability for `compute_diff` (it wants `&mut diff_opts`). All existing call sites of `repo.lock()` become `repo.borrow()` / `repo.borrow_mut()`.
-
-This is a small, mechanical change but it touches the existing tests too. **It's gated behind M2 of the new plan** rather than left as a "follow-up" so we don't ship the cleaner architecture sitting on top of legacy speculative bounds.
-
-### New error types
-
-```rust
-// error.rs (additions, all using thiserror)
-#[derive(Debug, thiserror::Error)]
-pub enum SessionError {
-    #[error("session directory not found at {path}")]
-    NotFound { path: PathBuf },
-    #[error("failed to read session file {path}")]
-    ReadFailed { path: PathBuf, #[source] source: std::io::Error },
-    #[error("failed to parse session jsonl: {message}")]
-    ParseFailed { message: String },
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum StoreError {
-    #[error("store path resolution failed")]
-    NoConfigDir,
-    #[error("failed to read store at {path}")]
-    ReadFailed { path: PathBuf, #[source] source: std::io::Error },
-    #[error("failed to write store at {path}")]
-    WriteFailed { path: PathBuf, #[source] source: std::io::Error },
-    #[error("store data is corrupt: {message}")]
-    Corrupt { message: String },
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum SearchError {
-    #[error("search root does not exist: {path}")]
-    RootMissing { path: PathBuf },
-    #[error("search failed: {message}")]
-    Failed { message: String },
-}
-```
-
-The notebook validated this approach — per-domain `thiserror` enums with descriptive names (not `Error`), implementing `std::error::Error` + `Debug` + `Display` + `source()` + `From` conversions. Avoids the "ball of mud" anti-pattern. Clippy's `error_impl_error` lint is happy because none of them are named `Error`.
-
-**Use `#[from]` on inner-error fields wherever the `?` operator should auto-convert.** Each `#[source]` field above represents a foreign error type bubbling up; if call sites would benefit from writing `tag_store.add_tag(new)?` instead of `.map_err(StoreError::WriteFailed)?`, replace `#[source]` with `#[from]` on that variant. Standard thiserror pattern, but worth being explicit so implementers don't forget. Two caveats:
-- A variant can have at most one `#[from]` field (otherwise the auto-derive can't pick which conversion to generate).
-- Variants that wrap the same source type (e.g. two `std::io::Error` variants distinguished by context) cannot both use `#[from]` — one of them must stay `#[source]` with explicit `.map_err()` at the call site.
-
-**Existing `Box<dyn Error + Send + Sync>` patterns inside error variants are kept as-is.** The bound is free here because every wrapped type (`std::io::Error`, `git2::Error`, `serde_json::Error`) is already `Send + Sync`, the bound matches Rust ecosystem convention, and it future-proofs error propagation through `mpsc::channel` if a worker ever needs to send a typed error rather than a `String`. This is the one place the "drop `Send + Sync`" rule has an explicit exception, and it's intentional.
-
-### Module layout (additions to `crates/core/src/`)
-
-```
-crates/core/src/
-  lib.rs              (re-exports)
-  id.rs               (NEW)  newtype IDs: TagId, SessionId, CommitSha
-  activity.rs         (NEW)  ActivityEntry, ActivityKind, ActivityTarget
-  session.rs          (NEW)  SessionInfo
-  tag.rs              (NEW)  Tag, TagKind, NewTag
-  todo.rs             (NEW)  TodoItem, TodoKind
-  commit.rs           (NEW)  CommitInfo, BranchInfo
-  traits.rs           (extended) drop Send+Sync from existing, add 4 new traits
-  error.rs            (extended) add SessionError, StoreError, SearchError
-```
+*(Honest caveat: this is more machinery than `SessionId(String)` everywhere. If the Rc optimization turns out to not matter in practice — profile in M15 — revert to `SessionId(String)` and delete `RawSessionInfo`. The v3 plan includes a task to measure this in the polish milestone.)*
 
 ---
 
-## Sessions crate (`codepeek-sessions`) — NEW
+## Bounded contexts: `search`, `todos`
 
-### Responsibility
-
-Implements `SessionStore`. Reads Claude Code session JSONL files from `~/.claude/projects/<encoded-path>/*.jsonl`, parses them into `SessionInfo`. Encapsulates Claude's on-disk format so the view layer never knows about JSONL.
-
-### How Claude Code stores sessions
-
-Confirmed by inspection of `~/.claude/projects/`:
-
-- One directory per project, name = absolute path with `/` and `.` replaced by `-` (e.g. `-home-delucca-Workspaces-src-codepeekhq-codepeek`).
-- Inside that directory: one `.jsonl` file per session, named `<uuid>.jsonl`.
-- Each line is a JSON object. The first line is typically a `file-history-snapshot` entry; subsequent lines are user/assistant messages with fields like `type`, `parentUuid`, `timestamp`, `sessionId`, `cwd`, `entrypoint`, `message: { role, content }`.
-
-### Implementation sketch
-
-```rust
-pub struct ClaudeSessionStore {
-    base: PathBuf,    // ~/.claude/projects, resolved at construction
-}
-
-impl ClaudeSessionStore {
-    pub fn discover() -> Result<Self, SessionError> {
-        let base = dirs::home_dir()
-            .map(|h| h.join(".claude").join("projects"))
-            .ok_or(SessionError::NotFound { path: PathBuf::from("~/.claude/projects") })?;
-        Ok(Self { base })
-    }
-}
-
-impl SessionStore for ClaudeSessionStore {
-    fn list_sessions(&self, repo: &Path) -> Result<Vec<SessionInfo>, SessionError> {
-        // 1. Encode repo path to Claude's directory naming convention
-        // 2. Read all *.jsonl files in that directory
-        // 3. For each file:
-        //    - Parse first + last non-snapshot lines for timestamps
-        //    - Count lines for message_count
-        //    - Extract `cwd` from any message line for verification
-        //    - Pull first user message text as `summary` (truncated)
-        // 4. Return sorted by last_active descending
-    }
-}
-```
-
-Note: no `Send + Sync` bound. `ClaudeSessionStore` is constructed cheaply inside the worker thread, not shared across threads.
-
-### Path encoding
-
-```rust
-fn encode_repo_path(repo: &Path) -> String {
-    repo.to_string_lossy().replace(['/', '.'], "-")
-}
-```
-
-### Performance note
-
-For each session file we only need first + last + count, NOT the full content. Use a streaming line reader (`BufRead::lines`) and skip body parsing of intermediate lines. For sessions with thousands of messages this is still O(lines) but each line is a cheap byte scan, no JSON parse.
-
-### Module layout
-
-```
-crates/sessions/src/
-  lib.rs              re-exports ClaudeSessionStore
-  store.rs            SessionStore implementation
-  jsonl.rs            line streaming + minimal parsing helpers
-```
-
-### Dependencies
-
-```toml
-[dependencies]
-codepeek-core.workspace = true
-serde = { workspace = true, features = ["derive"] }
-serde_json = { workspace = true }     # NEW workspace dep
-dirs.workspace = true
-```
+(Domain/port/error/app structure parallels the above; adapters in `crates/search`. Details compressed in the milestone descriptions below.)
 
 ---
 
-## Search crate (`codepeek-search`) — NEW
+## Presentation layer
 
-### Responsibility
+### Component Architecture, explicitly
 
-Implements `FileSearcher` and `TodoScanner`. Walks a workdir respecting `.gitignore`, returns matching file paths or TODO items.
+The rust-style-guide notebook's v3 review was clear: by handling per-view state mutations inline inside `handle_event` rather than producing a central `Action` that a central `update` function consumes, codepeek is no longer pure TEA. It's the **Component Architecture** pattern from ratatui's template. v3 names it explicitly:
 
-### Implementation sketch
+- `docs/decisions.md` gets an entry: *"2026-04-11: Presentation follows Component Architecture (ratatui template pattern), not pure TEA. Per-view state is private to each View; the central `Action` enum carries only cross-cutting concerns (navigation, quit, palette open, cross-view open). This is a deliberate departure from The Elm Architecture's central update function, made because cross-view mutations are rare and per-view state is high-cardinality (hundreds of small mutations per view)."*
+- `crates/view/src/chrome/action.rs` gets a module doc comment referencing this decision.
+- The view-development guide in `README.md` (added in M9) documents the pattern for future contributors.
 
-```rust
-pub struct RipgrepLikeSearcher;
+The important distinction per the Rust notebook: **the Component Architecture is a valid scalable pattern** ("finer-grained approach to event handling, with each component only dealing with the events it's interested in") — the issue was that v2 adopted it implicitly without naming it. v3 fixes the documentation gap.
 
-impl FileSearcher for RipgrepLikeSearcher {
-    fn find_files(&self, root: &Path, query: &str, limit: usize)
-        -> Result<Vec<PathBuf>, SearchError>
-    {
-        // Use `ignore::WalkBuilder::new(root).build()` to walk respecting .gitignore.
-        // For each file, fuzzy-match the relative path against the query.
-        // Use a simple subsequence match (not full Levenshtein) for v1.
-        // Stop after `limit` results.
-    }
-}
-
-pub struct TodoCommentScanner;
-
-impl TodoScanner for TodoCommentScanner {
-    fn scan(&self, root: &Path) -> Result<Vec<TodoItem>, SearchError> {
-        // Walk with `ignore::WalkBuilder`.
-        // For each text file, scan line-by-line for the regex
-        //   `(?i)(TODO|FIXME|HACK|XXX)[:\s]`
-        // Skip binary files using the same byte heuristic as app.rs.
-        // Return file:line:kind:text for each match.
-    }
-}
-```
-
-Both implementing structs are zero-sized — no `Send + Sync` consideration needed because they hold no state. Worker threads instantiate them as `RipgrepLikeSearcher` directly.
-
-### Why `ignore` over shelling out to ripgrep
-
-- `ignore` is the same crate ripgrep is built on. Same `.gitignore` semantics, no shell-out, no PATH issues.
-- We get programmatic results, not text parsing.
-- Trade-off: adds ~200KB to binary. Acceptable.
-- Alternative considered: shell out to `rg` with `--json`. Rejected — adds an external dependency the user must install separately.
-
-### Module layout
-
-```
-crates/search/src/
-  lib.rs              re-exports RipgrepLikeSearcher, TodoCommentScanner
-  files.rs            FileSearcher implementation
-  todos.rs            TodoScanner implementation
-  walk.rs             shared `ignore::Walk` configuration
-```
-
-### Dependencies
-
-```toml
-[dependencies]
-codepeek-core.workspace = true
-ignore = { workspace = true }     # NEW workspace dep
-regex = { workspace = true }      # NEW workspace dep
-```
-
----
-
-## Store crate (`codepeek-store`) — NEW
-
-### Responsibility
-
-Implements `TagStore`. Reads/writes a JSON file at `~/.config/codepeek/tags.json`. Single source of truth for persistent codepeek state. (When pins land in a future plan they go here too.)
-
-### File format
-
-`~/.config/codepeek/tags.json`:
-
-```json
-{
-  "version": 1,
-  "next_id": 5,
-  "tags": [
-    {
-      "id": 1,
-      "created_at": "2026-04-07T12:34:56Z",
-      "path": "src/main.rs",
-      "line": 42,
-      "kind": "issue",
-      "note": "this allocates in a hot loop"
-    }
-  ]
-}
-```
-
-`version` is reserved for future migrations. v1 always reads/writes version 1; an unknown version returns `StoreError::Corrupt`.
-
-### Implementation sketch
+### The central `Action` enum (cross-cutting only)
 
 ```rust
-pub struct JsonTagStore {
-    path: PathBuf,
-    inner: RefCell<TagFile>,    // load on construction, persist on each mutation
-}
+// crates/view/src/chrome/action.rs
 
-impl JsonTagStore {
-    pub fn open() -> Result<Self, StoreError> { /* resolve path, load or init */ }
-}
+use std::path::PathBuf;
+use codepeek_core::branches::domain::CommitSha;
 
-impl TagStore for JsonTagStore {
-    fn list_tags(&self) -> Result<Vec<Tag>, StoreError> {
-        Ok(self.inner.borrow().tags.clone())
-    }
+//! Cross-cutting actions produced by views that require App-level handling.
+//!
+//! Per-view state mutations (selecting a file, scrolling a viewer, toggling
+//! diff view, adding a tag) happen inline inside the view's handle_event.
+//! They do not produce an Action variant.
+//!
+//! This is the Component Architecture pattern documented in the ratatui
+//! template. See docs/decisions.md 2026-04-11.
 
-    fn add_tag(&self, new: NewTag<'_>) -> Result<Tag, StoreError> {
-        let mut inner = self.inner.borrow_mut();
-        let id = TagId(inner.next_id);
-        inner.next_id += 1;
-        let tag = Tag {
-            id,
-            created_at: SystemTime::now(),
-            path: new.path.to_path_buf(),
-            line: new.line,
-            kind: new.kind,
-            note: new.note.to_string(),
-        };
-        inner.tags.push(tag.clone());
-        self.persist(&inner)?;
-        Ok(tag)
-    }
-
-    fn remove_tag(&self, id: TagId) -> Result<(), StoreError> {
-        let mut inner = self.inner.borrow_mut();
-        inner.tags.retain(|t| t.id != id);
-        self.persist(&inner)?;
-        Ok(())
-    }
-}
-
-impl JsonTagStore {
-    fn persist(&self, inner: &TagFile) -> Result<(), StoreError> {
-        // 1. Serialize `inner` to a JSON string
-        // 2. Use tempfile::NamedTempFile::new_in(self.path.parent().unwrap())?
-        //    to create a securely-named temp file in the same directory
-        // 3. Write the JSON string to the temp file
-        // 4. Call temp.persist(&self.path) to atomically rename it over the target
-    }
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Action {
+    /// Application lifecycle.
+    Quit,
+    /// Cross-view navigation.
+    NavigateTo(crate::views::ViewId),
+    /// Esc — pop the back-stack.
+    Back,
+    /// Refresh the current view's data source (re-trigger on_enter).
+    Refresh,
+    /// Open the command palette overlay.
+    OpenPalette,
+    /// Close the command palette overlay.
+    ClosePalette,
+    /// Cross-view: open a file in FileViewerView, optionally jumping to line.
+    /// Used by Search, Tags, Todos, Home when the user picks a result.
+    OpenFileAt { path: PathBuf, line: Option<u32> },
+    /// Cross-view: open the file list of a commit.
+    /// Used by Branches + Home when the user picks a commit.
+    OpenCommit(CommitSha),
+    /// Dismiss the deleted-file peek overlay.
+    DismissPeek,
+    /// No-op (key didn't match anything in the current context).
+    Noop,
 }
 ```
 
-### Atomic write — use `tempfile`, don't roll our own
+Gone from the global enum vs v1 plan:
+- `SelectFile(usize)` — internal to `ChangesView`
+- `ToggleDiff` — internal to `FileViewerView`
+- `AddTag`/`RemoveTag` — internal to `FileViewerView` / `TagsView` (each holds the relevant use case)
+- `PaletteCommand(…)` — internal to `CommandPalette`
 
-The notebook flagged the v1 plan's hand-rolled `<path>.tmp` + rename helper. Replaced with `tempfile::NamedTempFile::persist()`. Reasons:
+### The View enum with Pattern B exhaustive delegates
 
-- **Garbage collection on crash:** if the process panics or is killed mid-write, `NamedTempFile` cleans up the temp file via its `Drop` impl. The hand-rolled approach leaves `.tmp` files littered across `~/.config/codepeek/`.
-- **Race / symlink safety:** `tempfile` generates unique randomized names in the target directory, preventing symlink attacks and races between two codepeek instances writing simultaneously.
-- **Same-filesystem guarantee:** `NamedTempFile::new_in(parent)` puts the temp on the same mount as the destination, so `persist` (which is just a rename) is atomic.
-- **Less code we have to test:** `tempfile` is already a workspace dev-dep used across the workspace. We're promoting it to a real dep for `crates/store`.
-
-### `RefCell` instead of `Mutex`
-
-Single-threaded design. The store is held as `Rc<dyn TagStore>` and accessed only from the main thread. `RefCell::borrow_mut` is the right primitive. Clippy's `rc_mutex` lint would flag `Rc<Mutex<…>>`.
-
-### Module layout
-
-```
-crates/store/src/
-  lib.rs              re-exports JsonTagStore
-  tags.rs             TagStore implementation
-  file.rs             TagFile (the on-disk shape) + serde derives
-```
-
-### Dependencies
-
-```toml
-[dependencies]
-codepeek-core.workspace = true
-serde = { workspace = true, features = ["derive"] }
-serde_json = { workspace = true }     # shared with sessions crate
-dirs.workspace = true
-tempfile = { workspace = true }       # promoted from dev-dep to real dep
-```
-
----
-
-## Git crate extensions (`codepeek-git`)
-
-### CommitLog impl
-
-`GitChangeDetector` gets a second trait implementation: `CommitLog`.
+Per v2, re-confirmed in v3: the `View` enum lives in `apps/tui/src/views_enum.rs`. Every delegate method is an exhaustive match — no `_ =>` wildcards. For 8 variants and 7 methods that's ~70 lines of trivial boilerplate. The compiler enforces every new view variant updates every delegate method, which is the whole reason we chose an enum over a trait object.
 
 ```rust
-impl CommitLog for GitChangeDetector {
-    fn recent_commits(&self, limit: usize) -> Result<Vec<CommitInfo>, ChangeError> {
-        let repo = self.repo.borrow();
-        let mut walker = repo.revwalk().map_err(/* … */)?;
-        walker.push_head().map_err(/* … */)?;
-        // For up to `limit` oids: lookup commit, build CommitInfo with newtype CommitSha
-    }
-
-    fn list_branches(&self) -> Result<Vec<BranchInfo>, ChangeError> {
-        let repo = self.repo.borrow();
-        repo.branches(Some(BranchType::Local))
-            .map(|iter| {
-                iter.filter_map(Result::ok)
-                    .map(|(branch, _)| /* build BranchInfo */)
-                    .collect()
-            })
-            .map_err(/* … */)
-    }
-
-    fn read_at_commit(&self, sha: &CommitSha, path: &Path) -> Result<String, ChangeError> {
-        let repo = self.repo.borrow();
-        let oid = git2::Oid::from_str(&sha.0).map_err(/* … */)?;
-        let commit = repo.find_commit(oid).map_err(/* … */)?;
-        let tree = commit.tree().map_err(/* … */)?;
-        // Same blob extraction pattern as read_at_head
-    }
-}
-```
-
-`CommitLog` has no `Send + Sync` bound. The trait is held as `Rc<dyn CommitLog>` from views.
-
-### What changes in the existing `GitChangeDetector`
-
-Two changes covered in M2:
-
-1. `Mutex<Repository>` → `RefCell<Repository>` (single-threaded)
-2. All `repo.lock().expect("repo mutex poisoned")` → `repo.borrow()` / `repo.borrow_mut()`
-
-The `ChangeDetector` trait loses its `Send + Sync` bound at the same time.
-
-### Dependencies
-
-No new external deps. `git2` already in.
-
----
-
-## View crate refactor (`codepeek-view`) — heavy
-
-### The View enum
-
-```rust
-// crates/view/src/views.rs (sibling file, not views/mod.rs)
+// apps/tui/src/views_enum.rs
 
 use std::borrow::Cow;
 use ratatui::Frame;
 use ratatui::crossterm::event::KeyEvent;
 use ratatui::layout::Rect;
 
-use crate::action::Action;
-use crate::theme::Theme;
-
-mod home;
-mod changes;
-mod sessions;
-mod search;
-mod tags;
-mod branches;
-mod todos;
-mod file_viewer;
-
-pub use home::HomeView;
-pub use changes::ChangesView;
-pub use sessions::SessionsView;
-pub use search::SearchView;
-pub use tags::TagsView;
-pub use branches::BranchesView;
-pub use todos::TodosView;
-pub use file_viewer::FileViewerView;
+use codepeek_view::chrome::action::Action;
+use codepeek_view::chrome::theme::Theme;
+use codepeek_view::views::{
+    HomeView, ChangesView, SessionsView, SearchView, TagsView,
+    BranchesView, TodosView, FileViewerView,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ViewId {
-    Home,
-    Changes,
-    Sessions,
-    Search,
-    Tags,
-    Branches,
-    Todos,
-    FileViewer,
+    Home, Changes, Sessions, Search, Tags, Branches, Todos, FileViewer,
 }
 
 pub enum View {
@@ -849,176 +1285,139 @@ impl View {
         }
     }
 
-    pub fn title(&self) -> Cow<'_, str> {
-        match self {
-            View::Home(v)       => v.title(),
-            View::Changes(v)    => v.title(),
-            View::Sessions(v)   => v.title(),
-            View::Search(v)     => v.title(),
-            View::Tags(v)       => v.title(),
-            View::Branches(v)   => v.title(),
-            View::Todos(v)      => v.title(),
-            View::FileViewer(v) => v.title(),
-        }
-    }
-
-    pub fn status_hints(&self) -> Cow<'_, [(&'static str, &'static str)]> {
-        match self {
-            View::Home(v)       => v.status_hints(),
-            View::Changes(v)    => v.status_hints(),
-            View::Sessions(v)   => v.status_hints(),
-            View::Search(v)     => v.status_hints(),
-            View::Tags(v)       => v.status_hints(),
-            View::Branches(v)   => v.status_hints(),
-            View::Todos(v)      => v.status_hints(),
-            View::FileViewer(v) => v.status_hints(),
-        }
-    }
-
-    pub fn handle_event(&mut self, key: KeyEvent) -> Action {
-        match self {
-            View::Home(v)       => v.handle_event(key),
-            View::Changes(v)    => v.handle_event(key),
-            View::Sessions(v)   => v.handle_event(key),
-            View::Search(v)     => v.handle_event(key),
-            View::Tags(v)       => v.handle_event(key),
-            View::Branches(v)   => v.handle_event(key),
-            View::Todos(v)      => v.handle_event(key),
-            View::FileViewer(v) => v.handle_event(key),
-        }
-    }
-    // render, on_enter, poll_loading, wants_raw_keys all follow the same
-    // exhaustive-match pattern. No `_ =>` wildcard arms — see below.
+    pub fn title(&self) -> Cow<'_, str> { /* exhaustive match */ }
+    pub fn status_hints(&self) -> Cow<'_, [(&'static str, &'static str)]> { /* exhaustive */ }
+    pub fn handle_event(&mut self, key: KeyEvent) -> Action { /* exhaustive */ }
+    pub fn render(&self, frame: &mut Frame, area: Rect, theme: &Theme) { /* exhaustive */ }
+    pub fn on_enter(&mut self) { /* exhaustive */ }
+    pub fn poll_loading(&mut self) { /* exhaustive */ }
+    pub fn wants_raw_keys(&self) -> bool { /* exhaustive */ }
 }
 ```
 
-Each variant struct (`HomeView`, `SessionsView`, …) defines its own methods with the same shape. The `match`-and-delegate plumbing is mechanical and ~80 lines total. No `Box`, no vtable, no `dyn`.
-
-**Delegate pattern: exhaustive match per variant, no wildcards.** Two patterns are tempting:
+### The Router in `apps/tui`
 
 ```rust
-// Pattern A — short, but loses exhaustiveness
-pub fn wants_raw_keys(&self) -> bool {
-    match self {
-        View::Search(v) => v.wants_raw_keys(),
-        _ => false,
+// apps/tui/src/router.rs
+
+use std::path::PathBuf;
+use std::rc::Rc;
+
+use codepeek_core::branches::app::{ListBranchesUseCase, RecentCommitsUseCase, ReadAtCommitUseCase};
+use codepeek_core::changes::app::{RefreshChangesUseCase, OpenChangedFileUseCase, PeekDeletedFileUseCase};
+use codepeek_core::search::app::FindFilesByQueryUseCase;
+use codepeek_core::sessions::app::ListRepoSessionsUseCase;
+use codepeek_core::tags::app::{AddTagUseCase, ListTagsUseCase, RemoveTagUseCase};
+use codepeek_core::todos::app::ScanRepoTodosUseCase;
+
+use codepeek_view::views::{
+    ChangesView, FileViewerView, HomeView, SearchView,
+    SessionsView, TagsView, TodosView, BranchesView,
+};
+
+use crate::views_enum::{View, ViewId};
+
+/// Every use case the app depends on. Built in main.rs from concrete adapters.
+pub struct AppDeps {
+    pub refresh_changes: Rc<RefreshChangesUseCase>,
+    pub open_changed_file: Rc<OpenChangedFileUseCase>,
+    pub peek_deleted_file: Rc<PeekDeletedFileUseCase>,
+    pub add_tag: Rc<AddTagUseCase>,
+    pub list_tags: Rc<ListTagsUseCase>,
+    pub remove_tag: Rc<RemoveTagUseCase>,
+    pub list_repo_sessions: Rc<ListRepoSessionsUseCase>,
+    pub find_files: Rc<FindFilesByQueryUseCase>,
+    pub scan_todos: Rc<ScanRepoTodosUseCase>,
+    pub list_branches: Rc<ListBranchesUseCase>,
+    pub recent_commits: Rc<RecentCommitsUseCase>,
+    pub read_at_commit: Rc<ReadAtCommitUseCase>,
+}
+
+pub struct Router {
+    deps: AppDeps,
+    repo_root: PathBuf,
+}
+
+impl Router {
+    pub fn new(deps: AppDeps, repo_root: PathBuf) -> Self {
+        Self { deps, repo_root }
     }
-}
 
-// Pattern B — explicit, exhaustive
-pub fn wants_raw_keys(&self) -> bool {
-    match self {
-        View::Home(v)       => v.wants_raw_keys(),
-        View::Changes(v)    => v.wants_raw_keys(),
-        View::Sessions(v)   => v.wants_raw_keys(),
-        View::Search(v)     => v.wants_raw_keys(),
-        View::Tags(v)       => v.wants_raw_keys(),
-        View::Branches(v)   => v.wants_raw_keys(),
-        View::Todos(v)      => v.wants_raw_keys(),
-        View::FileViewer(v) => v.wants_raw_keys(),
-    }
-}
-```
-
-**This plan uses Pattern B for every delegate method.** Reasoning: the whole point of going from `Box<dyn View>` to `enum View` was to gain exhaustive-match safety from the compiler. A `_ =>` wildcard arm throws that away — adding a future view that *also* wants raw keys would silently fall through the wildcard without a compile error. Pattern B costs ~30 extra lines of boilerplate but the compiler enforces that every new view variant explicitly answers every delegate method.
-
-To keep this from being painful, every per-variant view struct provides every delegate method even when the answer is trivial. Most views will have:
-
-```rust
-impl HomeView {
-    pub fn wants_raw_keys(&self) -> bool { false }
-    pub fn poll_loading(&mut self) { /* no-op or self.state.poll() */ }
-    pub fn on_enter(&mut self) { /* no-op or kick off load */ }
-}
-```
-
-These trivial methods are cheap to write and the compiler verifies you wrote one for every view. Aligns with the Rust style guide rule to "prefer exhaustive matches" that the rust-style-guide notebook called out explicitly.
-
-**`status_hints()` returns `Cow<'_, [(&'static str, &'static str)]>`** — strictly more general than a bare static slice while preserving the zero-allocation common case. Views with fixed hints define a `const HINTS: &[(&str, &str)] = &[…];` and return `Cow::Borrowed(HINTS)` (zero cost). Views with state-dependent hints — e.g. FileViewer toggling between `("d","show diff")` and `("d","hide diff")`, or Tags showing `("x","remove")` only when an entry is selected — return `Cow::Owned(vec![…])` and pay one Vec allocation per frame *only when their state actually requires it*. The notebook explicitly endorsed this `Cow` shape over a bare `&'static` slice for any trait that may need occasional dynamism.
-
-### Background loading types
-
-```rust
-// crates/view/src/loading.rs
-
-use std::sync::mpsc;
-
-pub enum LoadState<T> {
-    Idle,
-    Loading {
-        rx: mpsc::Receiver<Result<T, String>>,
-        spinner_tick: u8,
-    },
-    Ready(T),
-    Failed(String),
-}
-
-impl<T> LoadState<T> {
-    pub fn new() -> Self { Self::Idle }
-
-    /// Non-blocking: drains the receiver if loading. Returns true if state changed.
-    pub fn poll(&mut self) -> bool {
-        let LoadState::Loading { rx, spinner_tick } = self else {
-            return false;
-        };
-        match rx.try_recv() {
-            Ok(Ok(value)) => { *self = LoadState::Ready(value); true }
-            Ok(Err(msg))  => { *self = LoadState::Failed(msg); true }
-            Err(mpsc::TryRecvError::Empty) => {
-                *spinner_tick = spinner_tick.wrapping_add(1);
-                false
-            }
-            Err(mpsc::TryRecvError::Disconnected) => {
-                *self = LoadState::Failed("worker dropped".into());
-                true
+    pub fn build(&self, id: ViewId) -> View {
+        match id {
+            ViewId::Home => View::Home(HomeView::new(/* aggregator: reads multiple use cases */)),
+            ViewId::Changes => View::Changes(ChangesView::new(
+                self.deps.refresh_changes.clone(),
+                self.deps.open_changed_file.clone(),
+                self.deps.peek_deleted_file.clone(),
+            )),
+            ViewId::Sessions => View::Sessions(SessionsView::new(
+                self.deps.list_repo_sessions.clone(),
+                self.repo_root.clone(),
+            )),
+            ViewId::Search => View::Search(SearchView::new(
+                self.deps.find_files.clone(),
+                self.repo_root.clone(),
+            )),
+            ViewId::Tags => View::Tags(TagsView::new(
+                self.deps.list_tags.clone(),
+                self.deps.remove_tag.clone(),
+            )),
+            ViewId::Branches => View::Branches(BranchesView::new(
+                self.deps.list_branches.clone(),
+                self.deps.recent_commits.clone(),
+            )),
+            ViewId::Todos => View::Todos(TodosView::new(
+                self.deps.scan_todos.clone(),
+                self.repo_root.clone(),
+            )),
+            ViewId::FileViewer => {
+                // FileViewer is always built via build_file_viewer because it
+                // needs a path + optional line, not just an id.
+                panic!("FileViewer is built via build_file_viewer(), not build()")
             }
         }
     }
 
-    pub fn start(&mut self, rx: mpsc::Receiver<Result<T, String>>) {
-        *self = LoadState::Loading { rx, spinner_tick: 0 };
+    pub fn build_file_viewer(&self, path: PathBuf, line: Option<u32>) -> View {
+        View::FileViewer(FileViewerView::new(
+            path,
+            line,
+            self.deps.open_changed_file.clone(),
+            self.deps.add_tag.clone(),   // `m` adds a tag inline via the use case
+        ))
     }
 }
 ```
 
-### Spinner rendering
+The Router is now:
+- **In `apps/tui`** (composition root placement)
+- Holding `Rc<UseCase>` only — never a raw port trait object
+- Tiny: about 70 lines including the exhaustive match in `build`
+
+### The App in `apps/tui`
 
 ```rust
-// crates/view/src/components/spinner.rs (NEW)
+// apps/tui/src/app.rs (skeleton)
 
-pub struct Spinner;
+use ratatui::DefaultTerminal;
+use ratatui::Frame;
+use ratatui::crossterm::event::{self, Event, KeyEventKind};
+use ratatui::layout::{Margin, Rect};
 
-const FRAMES: &[char] = &['\u{280B}','\u{2819}','\u{2839}','\u{2838}','\u{283C}','\u{2834}','\u{2826}','\u{2827}','\u{2807}','\u{280F}'];
+use codepeek_view::chrome::action::Action;
+use codepeek_view::chrome::components::{CommandPalette, ErrorBar, StatusBar};
+use codepeek_view::chrome::{config, layout, theme};
 
-/// Render-loop ticks per spinner frame advance.
-/// At ~60fps render rate, dividing by 6 gives ~10fps spinner animation,
-/// which matches the conventional loading-indicator pace.
-const TICKS_PER_FRAME: u8 = 6;
-
-impl Spinner {
-    pub fn frame(tick: u8) -> char {
-        let index = (tick / TICKS_PER_FRAME) as usize % FRAMES.len();
-        FRAMES[index]
-    }
-
-    pub fn render(/* … */) { /* centered in area, with optional label */ }
-}
-```
-
-Used by every view in `LoadState::Loading`. The `TICKS_PER_FRAME` divisor matters: `LoadState::poll` runs every event-loop tick (~16ms), so without the divisor the spinner cycles through 10 frames in 167ms — visually jittery. Dividing by 6 gives a calmer ~10fps animation. The constant lives in `spinner.rs` so it's tweakable in one place.
-
-### App refactor
-
-```rust
-// crates/view/src/app.rs (after refactor)
+use crate::router::Router;
+use crate::views_enum::{View, ViewId};
 
 pub struct App {
     should_quit: bool,
     router: Router,
-    current: View,                // enum, not Box<dyn>
-    history: Vec<ViewId>,         // back-stack for Esc
+    current: View,
+    history: Vec<ViewId>,
     palette: Option<CommandPalette>,
-    peek_overlay: Option<PeekOverlay>,
     error_message: Option<String>,
 }
 
@@ -1032,40 +1431,40 @@ impl App {
             current,
             history: Vec::new(),
             palette: None,
-            peek_overlay: None,
             error_message: None,
         }
     }
 
-    pub fn run(mut self, mut terminal: DefaultTerminal) -> io::Result<()> {
+    pub fn run(mut self, mut terminal: DefaultTerminal) -> std::io::Result<()> {
         while !self.should_quit {
-            self.current.poll_loading();    // drain background results
+            self.current.poll_loading();
             terminal.draw(|frame| self.render(frame))?;
             self.handle_events()?;
         }
         Ok(())
     }
 
-    fn handle_events(&mut self) -> io::Result<()> {
-        if event::poll(config::TICK_RATE)? {
-            loop {
-                if let Event::Key(key) = event::read()?
-                    && key.kind == KeyEventKind::Press
-                {
-                    self.error_message = None;
+    fn render(&self, frame: &mut Frame) {
+        let theme = theme::current();
+        let full = frame.area();
+        let area = full.inner(Margin::new(config::OUTER_MARGIN, config::OUTER_MARGIN));
 
-                    // Order of dispatch:
-                    //   1. Palette open → route to palette
-                    //   2. Peek overlay visible → route to overlay
-                    //   3. Current view wants raw keys → route to view (skip global nav)
-                    //   4. Global nav key → handle here
-                    //   5. Otherwise → route to current view
-                    let action = self.dispatch_key(key);
-                    self.dispatch(action);
-                }
-                if !event::poll(Duration::ZERO)? { break; }
-            }
+        // Delegate render to current view
+        self.current.render(frame, area, theme);
+
+        // Overlay palette if open
+        if let Some(palette) = &self.palette {
+            palette.render(frame, full, theme);
         }
+    }
+
+    fn handle_events(&mut self) -> std::io::Result<()> {
+        // Dispatch order (unchanged from v2):
+        // 1. Palette → palette handler
+        // 2. Current view wants raw keys → view handler (skip global nav)
+        // 3. Global nav key → App
+        // 4. Otherwise → view handler
+        // ...
         Ok(())
     }
 
@@ -1085,326 +1484,138 @@ impl App {
 }
 ```
 
-### The Router
-
-```rust
-// crates/view/src/router.rs
-
-use std::cell::RefCell;
-use std::rc::Rc;
-
-pub struct Router {
-    change_detector: Rc<dyn ChangeDetector>,
-    highlighter: Rc<RefCell<dyn SyntaxHighlighter>>,
-    session_store: Rc<dyn SessionStore>,
-    tag_store: Rc<dyn TagStore>,
-    todo_scanner: Rc<dyn TodoScanner>,
-    file_searcher: Rc<dyn FileSearcher>,
-    commit_log: Rc<dyn CommitLog>,
-    repo_root: PathBuf,
-}
-
-impl Router {
-    pub fn build(&self, id: ViewId) -> View {
-        match id {
-            ViewId::Home     => View::Home(HomeView::new(/* aggregator */)),
-            ViewId::Changes  => View::Changes(ChangesView::new(self.change_detector.clone(), self.highlighter.clone())),
-            ViewId::Sessions => View::Sessions(SessionsView::new(self.session_store.clone(), self.repo_root.clone())),
-            ViewId::Search   => View::Search(SearchView::new(self.file_searcher.clone(), self.repo_root.clone())),
-            ViewId::Tags     => View::Tags(TagsView::new(self.tag_store.clone())),
-            ViewId::Branches => View::Branches(BranchesView::new(self.commit_log.clone())),
-            ViewId::Todos    => View::Todos(TodosView::new(self.todo_scanner.clone(), self.repo_root.clone())),
-            ViewId::FileViewer => panic!("FileViewer is built via build_file_viewer"),
-        }
-    }
-
-    pub fn build_file_viewer(&self, path: PathBuf, line: Option<u32>) -> View {
-        View::FileViewer(FileViewerView::new(
-            path,
-            line,
-            self.highlighter.clone(),
-            self.tag_store.clone(),     // FileViewer holds its own TagStore for `m`-to-mark
-        ))
-    }
-}
-```
-
-### Why `Rc<dyn Trait>` for stores (and not the View enum's static dispatch)
-
-The notebook validated this asymmetry. Two different decisions:
-
-| | Views | Stores |
-|---|---|---|
-| Variant set | Closed (8 fixed types) | Open (Json + Null + future Sqlite + test stubs) |
-| Need polymorphism | At compile time only | At runtime (router builds different impls based on availability) |
-| Right tool | `enum View` (static dispatch) | `Rc<dyn Trait>` (dynamic dispatch) |
-
-For stores, dynamic dispatch is the right shape because the binary builds a different graph at startup based on whether `~/.claude/projects` exists, whether `~/.config/codepeek/tags.json` is readable, etc. Each failure substitutes a `NullStore`. The view code can't know which one it got.
-
-### Hierarchical Action enum — Component Architecture pattern
-
-The notebook flagged the v1 plan's flat 15-variant Action enum as a "monolithic bottleneck." v2 takes the **Component Architecture** answer: strip the global enum to cross-cutting concerns only, and let each view handle its own state mutations internally.
-
-```rust
-// crates/view/src/action.rs (after revision)
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Action {
-    /// Application lifecycle.
-    Quit,
-    /// Cross-view navigation.
-    NavigateTo(ViewId),
-    /// Esc — pop the back-stack.
-    Back,
-    /// Refresh the current view's data source (re-trigger on_enter).
-    Refresh,
-    /// Open the command palette overlay.
-    OpenPalette,
-    /// Close the command palette overlay.
-    ClosePalette,
-    /// Cross-view: open a file in FileViewerView, optionally jumping to line.
-    /// Used by Search, Tags, Todos when the user picks a result.
-    OpenFileAt { path: PathBuf, line: Option<u32> },
-    /// Cross-view: open the file list of a commit.
-    /// Used by Branches when the user picks a commit.
-    OpenCommit(CommitSha),
-    /// Dismiss the deleted-file peek overlay.
-    DismissPeek,
-    /// No-op (key didn't match anything in the current context).
-    Noop,
-}
-```
-
-Variants the v1 plan had that are now **gone from the global enum** (they live as private state mutations inside the relevant View):
-
-- `SelectFile(usize)` — internal to `ChangesView` (the file list lives there now)
-- `ToggleDiff` — internal to `FileViewerView`
-- `AddTag(…)` / `RemoveTag(…)` — internal to `FileViewerView` and `TagsView` respectively (each view holds its own `Rc<dyn TagStore>` clone and calls it directly)
-- `PaletteCommand(…)` — internal to `CommandPalette`
-
-**What "internal" means in practice:** the view's `handle_event` method does the mutation directly, then returns `Action::Noop` (or one of the cross-cutting variants if a navigation needs to happen). The App never sees the per-view mutations.
-
-This is the Component Architecture pattern documented in Ratatui's component template. It scales: adding a new view never requires touching the global Action enum unless the new view introduces a new cross-cutting concern (which is rare).
-
-### Cross-view navigation keys
-
-Add to `crates/view/src/keybindings.rs`:
-
-```rust
-pub fn nav_target(key: &KeyEvent) -> Option<ViewId> {
-    match key.code {
-        KeyCode::Char('h') => Some(ViewId::Home),
-        KeyCode::Char('c') => Some(ViewId::Changes),
-        KeyCode::Char('s') => Some(ViewId::Sessions),
-        KeyCode::Char('/') => Some(ViewId::Search),
-        KeyCode::Char('t') => Some(ViewId::Tags),
-        KeyCode::Char('b') => Some(ViewId::Branches),
-        KeyCode::Char('T') => Some(ViewId::Todos),  // capital T to avoid conflict with `t`
-        _ => None,
-    }
-}
-
-pub fn is_palette(key: &KeyEvent) -> bool {
-    matches!(key.code, KeyCode::Char(':'))
-        || (key.code == KeyCode::Char('p') && key.modifiers.contains(KeyModifiers::CONTROL))
-}
-```
-
-### Conflict resolution between view-local and global keys
-
-**Resolution chosen** (was Open Decision #1 in v1, now resolved): the `View::wants_raw_keys()` method returns `true` when a view is in an input mode (Search while typing, CommandPalette open). The App checks this **before** consulting `nav_target`:
-
-```rust
-fn dispatch_key(&mut self, key: KeyEvent) -> Action {
-    if let Some(palette) = &mut self.palette {
-        return palette.handle_event(key);
-    }
-    if let Some(overlay) = &mut self.peek_overlay {
-        return overlay.handle_event(key);
-    }
-    if !self.current.wants_raw_keys() {
-        if let Some(target) = keybindings::nav_target(&key) {
-            return Action::NavigateTo(target);
-        }
-        if keybindings::is_palette(&key) {
-            return Action::OpenPalette;
-        }
-    }
-    self.current.handle_event(key)
-}
-```
-
-`wants_raw_keys` defaults to `false`. Only `SearchView` (in input mode) and `CommandPalette` override it to `true`. This is the standard "opt-in trait capability" pattern — the notebook validated it explicitly as idiomatic.
-
-### Status bar
-
-The status bar already accepts `&[(&str, &str)]`. After the refactor it accepts `&[(&'static str, &'static str)]` (a normal borrow of whatever `Cow` the view returned). Each view exposes its hints via `View::status_hints() -> Cow<'_, [(&'static str, &'static str)]>` — borrowed for static-hint views, owned for dynamic-hint views. App also appends global nav hints if there's room (terminal width ≥ 120 cols).
-
-### Layout
-
-The existing zen-mode layouts (`zen_file_list_layout`, `zen_viewer_layout`) are reused. Home gets its own layout helper.
-
-```rust
-// crates/view/src/layout.rs (additions)
-
-pub fn zen_home_layout(area: Rect) -> ZenLayout {
-    let height = area.height.saturating_mul(config::ZEN_HOME_MAX_HEIGHT_PERCENT) / 100;
-    let content_height = height + 2;
-
-    let [centered_v] = Layout::vertical([Constraint::Length(content_height)])
-        .flex(Flex::Center)
-        .areas(area);
-
-    let width = config::ZEN_HOME_MAX_WIDTH.min(area.width.saturating_sub(4));
-    let [centered_h] = Layout::horizontal([Constraint::Length(width)])
-        .flex(Flex::Center)
-        .areas(centered_v);
-
-    split_content_status(centered_h)
-}
-```
-
-### Config additions
-
-```rust
-// crates/view/src/config.rs (additions)
-pub const ZEN_HOME_MAX_WIDTH: u16 = 70;
-pub const ZEN_HOME_MAX_HEIGHT_PERCENT: u16 = 75;
-
-pub const HOME_ACTIVITY_LIMIT: usize = 30;
-pub const RECENT_COMMITS_LIMIT: usize = 50;
-pub const SEARCH_RESULT_LIMIT: usize = 200;
-```
-
-### Module layout (view crate)
-
-```
-crates/view/src/
-  lib.rs                  re-exports App, ViewId
-  app.rs                  App struct, dispatch, run loop
-  router.rs               Router (Rc-injected stores, builds Views)
-  action.rs               Action enum (small, hierarchical)
-  loading.rs              LoadState<T>, mpsc channel helpers
-  config.rs               (extended)
-  keybindings.rs          (extended)
-  layout.rs               (extended)
-  render_helpers.rs       (extended — relative-time formatter added)
-  theme.rs                (unchanged)
-  views.rs                (NEW)  pub use everything in views/, define View enum
-  views/                  (NEW)
-    home.rs               HomeView (uses ActivityFeedAggregator)
-    changes.rs            ChangesView (wraps FileList + FileViewer)
-    sessions.rs           SessionsView (uses LoadState<Vec<SessionInfo>>)
-    search.rs             SearchView (TextInput + LoadState<Vec<PathBuf>>)
-    tags.rs               TagsView
-    branches.rs           BranchesView (uses LoadState<(Vec<BranchInfo>, Vec<CommitInfo>)>)
-    todos.rs              TodosView (uses LoadState<Vec<TodoItem>>)
-    file_viewer.rs        FileViewerView (the contextual file display)
-  components.rs           (unchanged structure)
-  components/
-    error_bar.rs          (unchanged)
-    file_list.rs          (unchanged)
-    file_viewer.rs        (unchanged — the LIST item component)
-    peek_overlay.rs       (unchanged)
-    status_bar.rs         (extended for static slice hints)
-    command_palette.rs    (NEW)
-    text_input.rs         (NEW)
-    spinner.rs            (NEW)
-```
-
-**Note on naming:** `crates/view/src/views.rs` (sibling file) + `crates/view/src/views/home.rs` (subdirectory). This is the Rust 2018+ idiom that the rust-style-guide notebook recommends, matching the official Ratatui component template (`components.rs` + `components/home.rs`). Clippy `mod_module_files` enforces it for projects that want to.
-
-### `FileViewerView` vs reusing existing `FileViewer` component
-
-The existing `crates/view/src/components/file_viewer.rs` is a **reusable component** — it knows how to render highlighted lines with a gutter. It stays as-is.
-
-`FileViewerView` (the new top-level view) **wraps** the component. It owns the file path, the highlighter `Rc`, and the tag store `Rc`. Its `handle_event` translates `m`/`M` into direct `tag_store.add_tag(NewTag { … })` calls (no global Action), and translates `Esc` into `Action::Back`. This separation keeps the rendering component pure.
-
-### Reused components
-
-- `FileList` (the existing `FileChange`-specialized list) stays as-is, used by `ChangesView`.
-- `FileViewer` (the existing rendering component) stays as-is, used by `FileViewerView` and `ChangesView`.
-- `PeekOverlay` stays as-is, used by `ChangesView` for deleted-file peeks.
-- `ErrorBar` stays as-is, used by every view's `LoadState::Failed` rendering and by App for transient errors.
-- `StatusBar` extended to take `&'static [(&'static str, &'static str)]`.
-
-For Sessions/Tags/Search/Todos/Branches, each view instantiates its own ratatui `List` widget directly (~30 lines of rendering code per view). Generalizing `FileList<T>` is deliberately deferred — the duplication is small and the generic would obscure the rendering logic. If view #5+ feels painful, refactor then.
-
 ---
 
-## TUI app updates (`apps/tui`)
+## Composition root (`apps/tui/src/main.rs`)
 
 ```rust
-// apps/tui/src/main.rs (after revision)
-
 use std::cell::RefCell;
+use std::path::PathBuf;
 use std::rc::Rc;
+
+use codepeek_core::changes::app::{
+    RefreshChangesUseCase, OpenChangedFileUseCase, PeekDeletedFileUseCase,
+};
+use codepeek_core::changes::port::ChangeDetector;
+use codepeek_core::branches::app::{ListBranchesUseCase, RecentCommitsUseCase, ReadAtCommitUseCase};
+use codepeek_core::branches::port::CommitLog;
+use codepeek_core::search::app::FindFilesByQueryUseCase;
+use codepeek_core::search::port::FileSearcher;
+use codepeek_core::sessions::app::ListRepoSessionsUseCase;
+use codepeek_core::sessions::port::SessionStore;
+use codepeek_core::syntax::SyntaxHighlighter;
+use codepeek_core::tags::app::{AddTagUseCase, ListTagsUseCase, RemoveTagUseCase};
+use codepeek_core::tags::port::TagStore;
+use codepeek_core::todos::app::ScanRepoTodosUseCase;
+use codepeek_core::todos::port::TodoScanner;
+
+use codepeek_git::GitChangeDetector;
+use codepeek_search::{RipgrepLikeSearcher, TodoCommentScanner};
+use codepeek_sessions::ClaudeSessionStore;
+use codepeek_store::JsonTagStore;
+use codepeek_syntax::TreeSitter;
+
+use color_eyre::Result;
+
+mod app;
+mod config;
+mod router;
+mod stubs;
+mod views_enum;
 
 fn main() -> Result<()> {
     color_eyre::install()?;
 
     let (app_config, config_warning) = config::AppConfig::load();
-    if let Some(warning) = config_warning { eprintln!("codepeek: {warning}"); }
+    if let Some(warning) = config_warning {
+        eprintln!("codepeek: {warning}");
+    }
 
     let repo_root = std::env::current_dir()?;
 
-    // Existing
-    let detector: Rc<dyn ChangeDetector> = Rc::new(GitChangeDetector::open(&repo_root)?);
-    let highlighter: Rc<RefCell<dyn SyntaxHighlighter>> =
-        Rc::new(RefCell::new(TreeSitter::with_languages(app_config.enabled_languages())));
-
-    // The git detector implements both ChangeDetector and CommitLog.
-    // We need a second Rc with the CommitLog vtable. Since GitChangeDetector
-    // implements both, and Rc<dyn TraitA> can't be coerced to Rc<dyn TraitB>,
-    // we construct the binding twice from the same underlying instance.
-    // Easier: hold an Rc<GitChangeDetector> internally and coerce at injection sites.
+    // ─── 1. Build infrastructure adapters ───────────────────────────────────
     let git = Rc::new(GitChangeDetector::open(&repo_root)?);
     let detector: Rc<dyn ChangeDetector> = git.clone();
     let commit_log: Rc<dyn CommitLog> = git;
 
-    // New
+    let highlighter: Rc<RefCell<dyn SyntaxHighlighter>> = Rc::new(RefCell::new(
+        TreeSitter::with_languages(app_config.enabled_languages()),
+    ));
+
     let session_store: Rc<dyn SessionStore> = match ClaudeSessionStore::discover() {
-        Ok(s)  => Rc::new(s),
-        Err(e) => { eprintln!("codepeek: sessions disabled: {e}"); Rc::new(NullSessionStore) }
+        Ok(s) => Rc::new(s),
+        Err(e) => {
+            eprintln!("codepeek: sessions disabled: {e}");
+            Rc::new(stubs::NullSessionStore)
+        }
     };
+
     let tag_store: Rc<dyn TagStore> = match JsonTagStore::open() {
-        Ok(s)  => Rc::new(s),
-        Err(e) => { eprintln!("codepeek: tags disabled: {e}"); Rc::new(NullTagStore) }
+        Ok(s) => Rc::new(s),
+        Err(e) => {
+            eprintln!("codepeek: tags disabled: {e}");
+            Rc::new(stubs::NullTagStore)
+        }
     };
-    let todo_scanner: Rc<dyn TodoScanner> = Rc::new(TodoCommentScanner);
+
     let file_searcher: Rc<dyn FileSearcher> = Rc::new(RipgrepLikeSearcher);
+    let todo_scanner: Rc<dyn TodoScanner> = Rc::new(TodoCommentScanner);
 
-    let router = Router::new(
-        detector,
-        highlighter,
-        session_store,
-        tag_store,
-        todo_scanner,
-        file_searcher,
-        commit_log,
-        repo_root,
-    );
+    // ─── 2. Wrap adapters in application-layer use cases ────────────────────
+    let deps = router::AppDeps {
+        refresh_changes: Rc::new(RefreshChangesUseCase::new(detector.clone())),
+        open_changed_file: Rc::new(OpenChangedFileUseCase::new(
+            detector.clone(),
+            highlighter.clone(),
+        )),
+        peek_deleted_file: Rc::new(PeekDeletedFileUseCase::new(
+            detector.clone(),
+            highlighter.clone(),
+        )),
+        add_tag: Rc::new(AddTagUseCase::new(tag_store.clone())),
+        list_tags: Rc::new(ListTagsUseCase::new(tag_store.clone())),
+        remove_tag: Rc::new(RemoveTagUseCase::new(tag_store.clone())),
+        list_repo_sessions: Rc::new(ListRepoSessionsUseCase::new(session_store.clone())),
+        find_files: Rc::new(FindFilesByQueryUseCase::new(file_searcher.clone())),
+        scan_todos: Rc::new(ScanRepoTodosUseCase::new(todo_scanner.clone())),
+        list_branches: Rc::new(ListBranchesUseCase::new(commit_log.clone())),
+        recent_commits: Rc::new(RecentCommitsUseCase::new(commit_log.clone())),
+        read_at_commit: Rc::new(ReadAtCommitUseCase::new(commit_log.clone())),
+    };
 
+    // ─── 3. Wire Router ─────────────────────────────────────────────────────
+    let router = router::Router::new(deps, repo_root);
+
+    // ─── 4. Run the App ─────────────────────────────────────────────────────
     let terminal = ratatui::init();
-    let result = App::new(router).run(terminal);
+    let result = app::App::new(router).run(terminal);
     ratatui::restore();
+
     result?;
     Ok(())
 }
 ```
 
-### Two `Rc`s from one `GitChangeDetector`
+The composition root has three clearly-separated phases:
+1. **Build adapters** — instantiate concrete infrastructure
+2. **Wrap in use cases** — lift adapters through the application layer
+3. **Inject into the Router** — the Router holds use cases, never adapters
 
-`Rc<dyn TraitA>` doesn't coerce to `Rc<dyn TraitB>` even when the underlying type implements both. Standard pattern: hold an `Rc<GitChangeDetector>` and coerce to each trait object separately. Both `Rc<dyn ChangeDetector>` and `Rc<dyn CommitLog>` point to the same allocation, share the same refcount, and the trait dispatch picks the right vtable at call time.
+This is the pattern the architecture guide explicitly called out: *"The `tui` crate should instantiate the infrastructure adapters, inject them into the Application Services, and then inject those Application Services into the view's Router."*
 
-### Null stubs in the binary
-
-`NullSessionStore` and `NullTagStore` live in `apps/tui/src/stubs.rs`. They implement the trait with empty/no-op behavior so the TUI launches even when stores fail. Library crates stay strict — only the binary defines the fallbacks.
+### Null stubs (`apps/tui/src/stubs.rs`)
 
 ```rust
-// apps/tui/src/stubs.rs
+use std::path::Path;
+use codepeek_core::sessions::port::SessionStore;
+use codepeek_core::sessions::domain::SessionInfo;
+use codepeek_core::sessions::error::SessionError;
+use codepeek_core::tags::port::TagStore;
+use codepeek_core::tags::domain::{Tag, TagId, NewTag};
+use codepeek_core::tags::error::TagError;
 
 pub struct NullSessionStore;
+
 impl SessionStore for NullSessionStore {
     fn list_sessions(&self, _: &Path) -> Result<Vec<SessionInfo>, SessionError> {
         Ok(Vec::new())
@@ -1412,529 +1623,726 @@ impl SessionStore for NullSessionStore {
 }
 
 pub struct NullTagStore;
+
 impl TagStore for NullTagStore {
-    fn list_tags(&self) -> Result<Vec<Tag>, StoreError> { Ok(Vec::new()) }
-    fn add_tag(&self, _: NewTag<'_>) -> Result<Tag, StoreError> {
-        Err(StoreError::WriteFailed { /* … */ })
+    fn list_tags(&self) -> Result<Vec<Tag>, TagError> { Ok(Vec::new()) }
+
+    fn add_tag(&self, _: NewTag<'_>) -> Result<Tag, TagError> {
+        Err(TagError::WriteFailed {
+            path: std::path::PathBuf::from("/dev/null"),
+            source: std::io::Error::other("tag store unavailable"),
+        })
     }
-    fn remove_tag(&self, _: TagId) -> Result<(), StoreError> { Ok(()) }
+
+    fn remove_tag(&self, _: TagId) -> Result<(), TagError> { Ok(()) }
 }
 ```
 
-### Worker thread spawning
+Stubs live in the binary, not in library crates. Library crates stay strict — only the binary provides graceful-degradation fallbacks.
 
-The binary doesn't spawn workers — each view does it inside its own `on_enter`. The binary just constructs the `Router` and runs the `App`.
+---
 
-### Dependency additions
+## Rust-level refinements (v3 delta)
 
-`apps/tui/Cargo.toml`:
+### `#[non_exhaustive]` — applied selectively
 
-```toml
-[dependencies]
-codepeek-core.workspace = true
-codepeek-view.workspace = true
-codepeek-git.workspace = true
-codepeek-syntax.workspace = true
-codepeek-sessions.workspace = true     # NEW
-codepeek-search.workspace = true       # NEW
-codepeek-store.workspace = true        # NEW
-ratatui.workspace = true
-color-eyre.workspace = true
-serde.workspace = true
-toml.workspace = true
-dirs.workspace = true
+**Rust notebook v3 verdict:** applying `#[non_exhaustive]` to Data Objects actively harms readability by forcing `..` wildcards in every pattern match. Only use `#[non_exhaustive]` when adding a field/variant should be non-breaking AND callers don't routinely pattern-match on the type.
+
+**v3 rules for codepeek:**
+- ✅ Apply to open enums where a future variant is plausible:
+  - `ChangeKind`, `TagKind`, `TodoKind`, `LineChange` (in domain.rs files)
+  - `ActivityKind` (in home.rs — not kernel)
+  - `Theme` sub-structs (`TextColors`, `BorderColors`, `ChangeColors`, `DiffColors`, `SyntaxColors`, `UiColors`) — already done per 2026-04-06 decision
+- ❌ Do NOT apply to Data Objects where callers construct or pattern-match frequently:
+  - `FileChange`, `DiffHunk`, `DiffLine`, `ChangeMap`
+  - `Tag`, `SessionInfo`, `TodoItem`, `CommitInfo`, `BranchInfo`
+  - `HighlightSpan`, `HighlightedLine`
+  - `ActivityEntry`, `ActivityTarget` (home view matches all fields when dispatching)
+
+**Revert v2:** the v2 plan said "All types get `#[non_exhaustive]` matching the existing theme structs." That's wrong — walk it back per the Rust notebook's v3 verdict.
+
+### `CommitSha` is `[u8; 20]`, not `String`
+
+Covered in the branches context above. Summary: Git SHA-1 is a 20-byte fixed-width hash; wrap it in `CommitSha([u8; 20])` to eliminate heap allocation on every `Action::OpenCommit(sha)` dispatch. Display via hex encoding; serde via hex string for on-disk/wire compatibility.
+
+Performance difference: `Clone` goes from "allocate 40 chars + memcpy" to "memcpy 20 bytes". At a few dispatches per frame this is measurable.
+
+### `SessionId` is `Rc<str>`, not `String`
+
+Covered in the sessions context above. Summary: variable-length UUID-like IDs that cross many view boundaries benefit from refcounted sharing. Caveat: `Rc<str>` is `!Send`, so the worker thread produces `RawSessionInfo { id: String, … }` and the main thread converts to `SessionInfo { id: SessionId(Rc::from(s)), … }` on receive.
+
+**Honest trade-off:** this adds a `RawSessionInfo` → `SessionInfo` conversion step. Measure first (M17), revert if the `String` baseline is fine for 100-session scale.
+
+### Component Architecture — explicit documentation
+
+Already covered. Summary: `docs/decisions.md` gets a formal entry, `chrome/action.rs` gets a module doc comment, `README.md` gets a view-dev guide in M9.
+
+### Everything else from v2's Rust decisions is preserved
+
+- Drop `Send + Sync` from `ChangeDetector` and `SyntaxHighlighter`
+- `Box<dyn Error + Send + Sync>` retained inside error source fields
+- `Mutex<Repository>` → `RefCell<Repository>`
+- `Rc<UseCase>` for shared use-case ownership; `Rc<dyn Trait>` inside use cases for port injection
+- `Rc<RefCell<dyn SyntaxHighlighter>>` for the one shared-mutable port (acceptable per v3 rust review; revisit with `RenderContext<'a>` pattern if runtime borrow-check panics become a real problem — see Open Decisions)
+- `tempfile::NamedTempFile::persist()` for atomic JSON writes
+- `thiserror` `#[from]` preferred over `#[source]` for ergonomic `?`; `#[source]` when two variants wrap the same type
+- `Cow<'_, [(&'static str, &'static str)]>` for status_hints
+- `enum View` with Pattern B exhaustive delegates (no `_ =>` wildcards)
+- `TICKS_PER_FRAME = 6` for the spinner
+- Newtype IDs (revised to type-appropriate backing per above)
+- `NewTag<'a>` input struct for stable trait signature
+
+---
+
+## Sequence diagrams for key flows
+
+### Flow 1: Add a tag while viewing a file
+
+```
+User          App      FileViewerView    AddTagUseCase    TagStore (adapter)    File system
+ │             │            │                  │                │                    │
+ │ press 'm'   │            │                  │                │                    │
+ ├─────────────▶            │                  │                │                    │
+ │             │ handle_event(m)                │                │                    │
+ │             ├────────────▶                  │                │                    │
+ │             │            │ execute(NewTag)  │                │                    │
+ │             │            ├──────────────────▶                │                    │
+ │             │            │                  │ add_tag(new)   │                    │
+ │             │            │                  ├────────────────▶                    │
+ │             │            │                  │                │ write temp         │
+ │             │            │                  │                ├────────────────────▶
+ │             │            │                  │                │                    │
+ │             │            │                  │                │ persist (rename)   │
+ │             │            │                  │                ├────────────────────▶
+ │             │            │                  │                │                    │
+ │             │            │                  │                │◀── Ok ─────────────┤
+ │             │            │                  │◀── Ok(tag) ────┤                    │
+ │             │            │◀── Ok(tag) ──────┤                                    │
+ │             │            │ update local tag-count state      │                    │
+ │             │◀── Action::Noop (no global nav required)       │                    │
+ │             │            │                                                        │
+ │             │ draw(next frame — tag count in title updates)                       │
+ │◀────────────                                                                       
 ```
 
----
+Notes:
+- The view never touches the `TagStore` trait. It holds `Rc<AddTagUseCase>`.
+- The use case's `execute` is synchronous (the persist is ~1ms for a small tag file) and blocks the main thread.
+- If the persist fails, `execute` returns `Err(TagError::…)`; the view sets `self.error_message = Some("…")`.
 
-## Workspace dependency additions (root `Cargo.toml`)
+### Flow 2: Navigate Home → Sessions with background load
 
-```toml
-[workspace.dependencies]
-# existing entries unchanged
-
-# Internal crates (new)
-codepeek-sessions = { path = "crates/sessions" }
-codepeek-search   = { path = "crates/search" }
-codepeek-store    = { path = "crates/store" }
-
-# JSON (new — used by sessions and store)
-serde_json = "1.0.133"
-
-# File walking and regex (new — used by search)
-ignore = "0.4.23"
-regex  = "1.11.1"
-
-# Atomic writes (promoted from dev-dep to real workspace dep — used by store)
-# `tempfile` was already in [workspace.dependencies] as a dev-dep; nothing to add.
+```
+User         App       Router     SessionsView    (worker thread)    ClaudeSessionStore
+ │            │           │             │                 │                    │
+ │ press 's'  │           │             │                 │                    │
+ ├────────────▶           │             │                 │                    │
+ │            │ nav_target(s) → Some(ViewId::Sessions)    │                    │
+ │            │           │             │                 │                    │
+ │            │ Action::NavigateTo(Sessions)              │                    │
+ │            ├──build(Sessions)───────▶                  │                    │
+ │            │           │             │                 │                    │
+ │            │ View::Sessions(SessionsView::new(...))    │                    │
+ │            │           │             │                 │                    │
+ │            ├──current.on_enter()────▶                  │                    │
+ │            │           │             ├ spawn worker ──▶                    │
+ │            │           │             │                 │ discover()         │
+ │            │           │             │                 ├────────────────────▶
+ │            │           │             │                 │◀── Ok(store) ──────┤
+ │            │           │             │                 │ list_sessions(...)  │
+ │            │           │             │                 ├────────────────────▶
+ │            │           │             │                 │  read 47 JSONL     │
+ │            │           │             │                 │   files (~200ms)   │
+ │            │           │             │                 │◀── Vec<Raw> ───────┤
+ │            │           │             │ ◀── tx.send ────┤
+ │            │ (meanwhile: draw/draw/draw — spinner ticks, ~12 frames pass)   │
+ │            │           │             │                                      │
+ │            │ next tick: poll_loading                                         │
+ │            ├────────────────────────▶ try_recv → Ok(Raw vec)                │
+ │            │                         │ map Raw → SessionInfo (Rc<str>)      │
+ │            │                         │ state = LoadState::Ready(vec)        │
+ │            │                         │                                      │
+ │            │ draw → render Ready state: show session list                  │
+ │◀───────────                                                                   
 ```
 
-`[workspace.members]` adds `crates/sessions`, `crates/search`, `crates/store`.
+Notes:
+- The View enum's `poll_loading` is called once per tick. SessionsView's `poll_loading` calls `state.poll()` on its `LoadState<Vec<SessionInfo>>`.
+- The worker owns a `Sender<Result<Vec<RawSessionInfo>, String>>`; the view owns the matching `Receiver`.
+- Because `Rc<str>` is `!Send`, the worker produces `Vec<RawSessionInfo>` (with `String` ids) and the main thread converts on receive.
+- The `SessionInfo` DTO that the view actually works with has `SessionId(Rc<str>)` so repeated clones are free.
 
-`tempfile` is already in `[workspace.dependencies]` (used as a dev-dep elsewhere). The store crate references it as a real dep via `tempfile = { workspace = true }` — no version change needed.
+### Flow 3: Refresh Changes after a file edit
 
-**Versions to verify at implementation time** via Context7: `serde_json`, `ignore`, `regex`. All others are unchanged from the existing workspace.
+```
+User      App      ChangesView   RefreshChangesUseCase   ChangeDetector (git2)
+ │         │            │                  │                      │
+ │ press 'r' in Changes view                                       │
+ ├─────────▶            │                  │                      │
+ │         │ handle_event(r)                │                      │
+ │         ├────────────▶                  │                      │
+ │         │            │ (returns Action::Refresh)               │
+ │         ◀────────────┤                  │                      │
+ │         │ dispatch(Action::Refresh)      │                      │
+ │         │ → current.on_enter()           │                      │
+ │         ├────────────▶                  │                      │
+ │         │            │ refresh_use_case.execute()               │
+ │         │            ├──────────────────▶                      │
+ │         │            │                  │ detect_changes()      │
+ │         │            │                  ├──────────────────────▶
+ │         │            │                  │◀── Vec<FileChange> ──┤
+ │         │            │◀── Vec<FileChange> ┤                    │
+ │         │            │ file_list.update_files(vec)             │
+ │         │            │ (preserves selection by path if possible)│
+ │         │◀───────────                                           │
+ │         │ draw                                                  │
+ │◀────────                                                         
+```
+
+Notes:
+- This flow is synchronous because `detect_changes()` on a local repo is typically <10ms.
+- A future refactor could wrap it in the LoadState pattern for consistency; v3 keeps it synchronous because the UX trade-off (flash of spinner on fast refresh) isn't worth it.
 
 ---
 
-## Implementation milestones
+## Implementation milestones — v3 vertical slices
 
-Seventeen milestones across six phases. The phasing changed slightly from v1 — Phase A now includes a dedicated "background loading" milestone (M3) before the View enum refactor (M4), so the loading infrastructure is in place before any view that needs it lands.
+**v2 had 17 technical phases (Foundation, Storage, Discovery, Git, Sessions, Polish).** The architecture guide's review pointed out that this is "package by tool" phasing — it organizes the plan around layers rather than features, which makes it hard to deliver a single coherent slice of the domain end-to-end.
 
-Each milestone produces a working `just check` and (from M5 onward) a runnable `just run`.
+**v3 has 9 vertical slices.** Each milestone M2–M8 delivers a complete bounded context (domain + port + use cases + adapter + view) in one go. This is Option 3 of the phase ordering — it leans on M1 (the Shell refactor) to lay all the groundwork so every subsequent milestone can focus on shipping ONE context end-to-end.
+
+| # | Milestone | What ships | Context(s) touched | Risk |
+|---|-----------|-----------|--------------------|------|
+| 0 | Pre-refactor hygiene | Drop `Send + Sync` from traits; `Mutex<Repository>` → `RefCell<Repository>` | core, git | **Low** — 2 files, no semantic change |
+| 1 | Shell refactor | Core reorganized, use cases introduced, Router in apps/tui, Changes vertical slice verified | core/*, view, apps/tui, git | **High** — touches every file |
+| 2 | Tags slice | `t` marks, `T`ags view, JSON persistence, FileViewer integration | `tags`, `store`, view, apps/tui | Medium |
+| 3 | Search slice | `/` fuzzy file finder with background load | `search`, `search` (crate), view | Medium |
+| 4 | Todos slice | `T` (capital) TODO/FIXME inbox | `todos`, `search` (crate reuse), view | Low |
+| 5 | Branches slice | `b` branch list + recent commits | `branches`, `git` (extended), view | Medium |
+| 6 | Sessions slice | `s` Claude session list with JSONL reader | `sessions`, `sessions` (crate), view | Medium |
+| 7 | Home + activity feed | Home view with cross-context aggregator | `home.rs`, depends on 1–6 | Medium |
+| 8 | Command palette | `:` overlay with fuzzy command filter | view chrome | Low |
+| 9 | Polish + docs + decisions | Empty states, errors, perf check, decisions.md, README | everything | Low |
+
+**Each milestone delivers a bit of user-visible value.** No milestone is "internal scaffolding only." No milestone takes more than ~1 week at a steady pace.
 
 ---
 
-### Phase A — Foundation
+### Milestone 0: Pre-refactor hygiene pass
 
-#### Milestone 1: New crate scaffolding
+**You'll see:** no user-visible change. Two small single-threaded cleanups that the Rust notebook flagged in the v3 review, done against the *current* file layout before the M1 reorganization begins. Doing them here shrinks M1's blast radius and ships as a clean standalone commit.
 
-**You'll see:** Three new empty crates exist and compile. No new functionality yet.
+**Risk: low.** Two files touched, existing tests cover every code path, zero semantic change.
 
 **What to build:**
-1. Create `crates/sessions/Cargo.toml`, `crates/search/Cargo.toml`, `crates/store/Cargo.toml`. Each has only a `lib.rs` with a comment.
-2. Add the three new members to root `Cargo.toml` `[workspace.members]`.
-3. Add `codepeek-sessions`, `codepeek-search`, `codepeek-store` to `[workspace.dependencies]`.
-4. Add `serde_json`, `ignore`, `regex` to `[workspace.dependencies]` (versions pinned).
-5. `apps/tui/Cargo.toml`: declare the three new crates as dependencies (still unused).
 
-**Verify:** `just check` passes. All 8 workspace members compile.
+1. **Drop `Send + Sync` from the current traits.**
+   - `crates/core/src/traits.rs`: change `pub trait ChangeDetector: Send + Sync { … }` to `pub trait ChangeDetector { … }`.
+   - Same file: `pub trait SyntaxHighlighter: Send + Sync { … }` → `pub trait SyntaxHighlighter { … }`.
+   - Nothing in the workspace requires the bound (the only consumer is `App`, which holds `Box<dyn ChangeDetector>` + `Box<dyn SyntaxHighlighter>` — `Box<dyn T>` doesn't need `T: Send + Sync` unless the `Box` itself crosses thread boundaries, which it doesn't).
 
-**Crates touched:** root `Cargo.toml`, `crates/sessions`, `crates/search`, `crates/store`, `apps/tui`.
+2. **`Mutex<Repository>` → `RefCell<Repository>` in the git adapter.**
+   - `crates/git/src/detector.rs`: replace `use std::sync::Mutex;` with `use std::cell::RefCell;`.
+   - Replace `repo: Mutex<Repository>` (the struct field) with `repo: RefCell<Repository>`.
+   - `GitChangeDetector::open`: replace `Mutex::new(repo)` with `RefCell::new(repo)`.
+   - `detect_changes`: replace `let repo = self.repo.lock().expect("repo mutex poisoned");` with `let repo = self.repo.borrow();`. The function uses `repo` read-only (calls `.head()`, `.workdir()`, `.statuses()`, `.index()`), so `borrow()` is sufficient.
+   - `compute_diff`: same substitution — `borrow()` is fine because `DiffOptions` is a local `let mut diff_opts` that the `diff_tree_to_workdir_with_index` call consumes separately; the `repo` handle itself is only read.
+   - `read_at_head`: same substitution — fully read-only.
+   - Remove the `.expect("repo mutex poisoned")` expectation string entirely. If `RefCell::borrow` ever panics, it's because the code has a genuine re-entrancy bug (the panic message is `RefCell<T> already mutably borrowed`), which is the exact bug-catching guarantee the `Mutex` was providing.
 
----
+**Verify:** `just check` passes. `just run` launches the existing UX bit-for-bit (no observable difference — the whole point is that the cleanup is invisible).
 
-#### Milestone 2: Core types, traits, newtypes — and remove `Send + Sync`
+**Why it's safe:**
+- The codebase is single-threaded today. The `Mutex` was never lock-contended because there's only one thread. Clippy's `mutex_atomic` / `rc_mutex` lints would flag this pattern in a single-threaded app per the Rust notebook's v3 review.
+- The `RefCell` swap is a zero-semantic-change refactor. Every existing test continues to pass unchanged.
+- Dropping `Send + Sync` from the traits is a pure relaxation of bounds — no existing call site depends on them.
 
-**You'll see:** `codepeek-core` exposes new types (newtype IDs, NewTag, Tag, SessionInfo, TodoItem, CommitInfo, BranchInfo, ActivityEntry) and traits (TagStore, SessionStore, TodoScanner, FileSearcher, CommitLog). Existing `ChangeDetector`/`SyntaxHighlighter` traits no longer require `Send + Sync`. `GitChangeDetector` uses `RefCell<Repository>` instead of `Mutex<Repository>`. Tests prove everything compiles and the existing change-viewer flow still works.
+**Why pre-M1 rather than inside M1:**
+- M0 is a small, fast, low-risk commit that can ship on its own and be validated end-to-end before touching the bigger architectural moves.
+- M1's shell refactor then has a smaller blast radius — it focuses entirely on the reorganization and use-case introduction, not on incidental Rust cleanups.
+- A future contributor reading the git log sees a clean progression: "tidy the trait bounds and interior mutability" → "reorganize the crate layout" → "introduce the application layer" — rather than a single giant commit mixing all three.
 
-**What to build:**
-1. `crates/core/src/id.rs` — `TagId`, `SessionId`, `CommitSha` newtypes with `serde` derives.
-2. `crates/core/src/tag.rs`, `session.rs`, `todo.rs`, `commit.rs`, `activity.rs` — domain types using the newtypes.
-3. `crates/core/src/tag.rs` — define `NewTag<'a>` input struct.
-4. `crates/core/Cargo.toml` — add `serde = { workspace = true, features = ["derive"] }` (small concession; first serde dep in core).
-5. Extend `crates/core/src/traits.rs` with the four new traits (no `Send + Sync` bounds). **Also remove `Send + Sync` from `ChangeDetector` and `SyntaxHighlighter`.**
-6. Extend `crates/core/src/error.rs` with `SessionError`, `StoreError`, `SearchError`.
-7. Re-export everything from `lib.rs`.
-8. **`crates/git/src/detector.rs`:** replace `Mutex<Repository>` with `RefCell<Repository>`. Replace all `repo.lock().expect(…)` with `repo.borrow()` / `repo.borrow_mut()`. Update existing tests.
-9. Unit tests: TagId/SessionId/CommitSha JSON round-trip, TagKind round-trip, NewTag construction, error Display formatting, `CommitSha::short()` length-clamping.
-
-**Verify:** `just test --workspace` passes. `just run` still launches the existing UX bit-for-bit (this milestone is invisible to the user).
+**Not in M0:**
+- The `Box<dyn ChangeDetector>` → `Rc<dyn ChangeDetector>` change in `App`. That's bundled with the Router refactor in M1 because sharing the detector across views is what makes the `Rc` necessary.
+- Any module reorganization (that's M1 sub-step 1).
+- Any new types or traits.
 
 **Crates touched:** `crates/core`, `crates/git`.
 
----
-
-#### Milestone 3: Background loading infrastructure (`LoadState<T>` + spinner)
-
-**You'll see:** Internal scaffolding only. No user-visible change. The view crate has a `loading.rs` module with `LoadState<T>`, a `Spinner` component, and tests showing the lifecycle works against a stub worker.
-
-**What to build:**
-1. `crates/view/src/loading.rs` — `LoadState<T>` enum with `new`, `start`, `poll` methods.
-2. `crates/view/src/components/spinner.rs` — `Spinner::frame(tick)` and `Spinner::render` (centered in area, with optional label below). Includes the `TICKS_PER_FRAME = 6` constant so the spinner runs at ~10fps even though `poll_loading` runs at ~60fps.
-3. `crates/view/src/components.rs` — re-export `Spinner`.
-4. Unit tests using `std::sync::mpsc::channel()`:
-   - `LoadState::start` transitions Idle → Loading
-   - `poll` on Loading with no message returns false and ticks the spinner
-   - `poll` on Loading with `Ok(value)` transitions to Ready
-   - `poll` on Loading with `Err(msg)` transitions to Failed
-   - `poll` on Ready/Idle/Failed returns false (no-op)
-   - Disconnected sender transitions to Failed
-
-**Verify:** `just check` passes. Tests pass. `just run` is unchanged.
-
-**Crates touched:** `crates/view`.
+**Decisions log:** append `2026-04-11: Dropped Send + Sync speculative bounds from ChangeDetector and SyntaxHighlighter; migrated GitChangeDetector's interior mutability from Mutex<Repository> to RefCell<Repository>. Single-threaded design per the rust-style-guide notebook's review.`
 
 ---
 
-#### Milestone 4: View enum + Router refactor (no behavior change)
+### Milestone 1: Shell refactor — Shared Kernel + application layer + composition root move
 
-**You'll see:** `just run` still launches the existing Changes flow. The internals are different but the user experience is identical. This is the riskiest refactor; doing it before any new view ensures the old one still works.
+**You'll see:** Launching codepeek shows the same file list and file viewer as today. No new features. But `ls crates/core/src/` shows bounded-context directories, `ls apps/tui/src/` shows `router.rs` + `app.rs` + `views_enum.rs`, and `cargo tree` shows the v3 dependency graph. **This milestone is the gate for everything else.**
 
-**What to build:**
-1. `crates/view/src/views.rs` (sibling file) — `View` enum, `ViewId` enum, `mod` declarations and re-exports. Every delegate method (`handle_event`, `render`, `on_enter`, `poll_loading`, `wants_raw_keys`, `status_hints`, `title`) uses **Pattern B** — exhaustive `match` over every variant, no `_ =>` wildcards. This is the whole reason we picked enum dispatch; the compiler must enforce that adding a future view variant updates every delegate method. `status_hints` returns `Cow<'_, [(&'static str, &'static str)]>` so future views can return dynamic hints without a breaking trait change.
-2. `crates/view/src/views/changes.rs` — `ChangesView`. Move the existing `Focus`/`FileList`/`FileViewer` orchestration out of `App` into `ChangesView`. `ChangesView::new` takes `Rc<dyn ChangeDetector>` + `Rc<RefCell<dyn SyntaxHighlighter>>`. Defines its own methods matching the View enum's delegate signatures.
-3. `crates/view/src/views/file_viewer.rs` — `FileViewerView` (the contextual file-display view used by `OpenFileAt`). Takes path, optional jump-to-line, highlighter, tag store. For now it's only used internally by ChangesView (M5 will add cross-view openers).
-4. `crates/view/src/router.rs` — `Router` struct holding `Rc`-cloned trait objects. `build(ViewId::Changes)` returns `View::Changes(ChangesView::new(…))`. Other variants `unimplemented!()` for now.
-5. Refactor `crates/view/src/app.rs`:
-   - Replace `focus`, `file_list`, `file_viewer`, `change_detector`, `highlighter` fields with `router: Router`, `current: View`, `history: Vec<ViewId>`.
-   - `App::new(router: Router)` instead of `App::new(detector, highlighter)`.
-   - `render` matches on `current` and delegates to the view variant.
-   - `handle_events` does dispatch via the new ordered scheme (palette > overlay > raw keys > nav > view).
-   - For now only Quit/Refresh/Back/Noop actions are dispatched at App level.
-6. Update `apps/tui/src/main.rs` to construct a `Router` (with stub stores for slots not yet built — define a `NullSessionStore` etc. in `apps/tui/src/stubs.rs` upfront; they'll be reused in M6+). For this milestone the only stores actually used are `change_detector`, `highlighter`, `tag_store`. Use `NullTagStore` for now.
-7. Move all existing app-level tests in `app.rs` into `views/changes.rs` (they're really ChangesView tests now).
-8. Add new app-level tests: stub View variant via `View::Changes(stub)`, verify routing/back/quit at the App level.
+**Risk: high.** This touches nearly every source file. Run `just check` after every sub-step. Keep the work on a branch. Budget 2–3 sittings.
 
-**Verify:** `just check` passes. `just run` shows the file list, navigation works, file viewer works, refresh works, peek overlay works, errors render. **Bit-for-bit the same UX as before.**
+**Sub-steps (each one independently compiles):**
 
-**Crates touched:** `crates/view`, `apps/tui`.
+1. **Reorganize `core` internally.**
+   - Create `crates/core/src/kernel/` with `highlight.rs` (move `HighlightKind`, `HighlightSpan`, `HighlightedLine` here)
+   - Create `crates/core/src/syntax/` with `port.rs` (`SyntaxHighlighter` trait, no `Send + Sync`) and `error.rs` (`SyntaxError`)
+   - Create `crates/core/src/changes/` with `domain.rs` (move `FileChange`, `ChangeKind`, `DiffHunk`, `DiffLine`, `LineChange`, `ChangeMap`), `port.rs` (`ChangeDetector` trait, no `Send + Sync`), `error.rs` (`ChangeError`)
+   - Update `crates/core/src/lib.rs` re-exports
+   - Delete the old flat files (`change.rs`, `diff.rs`, `highlight.rs`, `error.rs`, `traits.rs`)
+   - Fix every `use codepeek_core::XX` site in `crates/git`, `crates/syntax`, `crates/view`, `apps/tui` (they still work because of re-exports, but idiomatic imports should be updated)
+   - Run `just test --workspace` — all existing tests still pass.
 
----
+2. **Verify M0's trait-bound removal and `RefCell` migration are preserved at the new paths.**
+   - M0 already dropped `Send + Sync` from `ChangeDetector` and `SyntaxHighlighter` in `crates/core/src/traits.rs`, and migrated `GitChangeDetector` to `RefCell<Repository>`.
+   - Sub-step 1 above moves the trait definitions from `crates/core/src/traits.rs` to `crates/core/src/changes/port.rs` and `crates/core/src/syntax/port.rs`. After the move, confirm the new files have no `: Send + Sync` bounds. No new code change — this sub-step is a sanity check that M0's cleanup survived the reorganization intact.
 
-#### Milestone 5: HomeView stub + landing redirect + cross-view nav
+3. **Introduce use cases in `crates/core/src/changes/app.rs`.**
+   - `RefreshChangesUseCase { detector: Rc<dyn ChangeDetector> }` with `new` + `execute(&self) -> Result<Vec<FileChange>, ChangeError>`
+   - `OpenChangedFileUseCase { detector: Rc<dyn ChangeDetector>, highlighter: Rc<RefCell<dyn SyntaxHighlighter>> }` with `execute(&self, path, kind) -> Result<OpenedFile, ChangeError>`
+   - `PeekDeletedFileUseCase` with `execute(&self, path) -> Result<Vec<HighlightedLine>, ChangeError>`
+   - Define `OpenedFile` DTO: `{ path, lines, change_map, diff_hunks }`
+   - Unit tests with a stub `ChangeDetector` implementing the trait in-file
 
-**You'll see:** Launching codepeek lands on a Home placeholder ("Welcome to codepeek — press `c` for Changes") instead of straight to the file list. `c` navigates to Changes; `Esc` from Changes goes back to Home. `h` in Changes goes back to Home directly.
+4. **Reorganize `view` crate into `chrome/` and `views/`.**
+   - Create `crates/view/src/chrome/` subdirectory
+   - Move `theme.rs`, `layout.rs`, `render_helpers.rs`, `keybindings.rs`, `action.rs`, `components.rs`, `components/` into `chrome/`
+   - Update re-exports so existing call sites still work via `use codepeek_view::chrome::*`
+   - Create `crates/view/src/views/` and `crates/view/src/views.rs` (sibling)
+   - Move the existing App/dispatch/focus logic into a new `views/changes.rs` as `ChangesView`
+   - `ChangesView::new` takes `Rc<RefreshChangesUseCase>`, `Rc<OpenChangedFileUseCase>`, `Rc<PeekDeletedFileUseCase>` — no more `Box<dyn ChangeDetector>`
+   - `FileList`, `FileViewer`, `PeekOverlay` stay in `chrome/components/` (they're reusable widgets, not views)
+   - Build + test; the existing tests move from `app.rs` to `views/changes.rs`
 
-**What to build:**
-1. `crates/view/src/views/home.rs` — `HomeView`. State: nothing yet (Idle LoadState placeholder). Render: a centered title and a hint to press `c`. `handle_event` returns `Noop` for everything (the App handles `h`/`c` globally). Status hints: `&[("c","changes"), ("q","quit")]` as a const slice.
-2. `Router::build(ViewId::Home)` returns `View::Home(HomeView::new())`.
-3. `App::new` builds `Home` as the initial view (was `ViewId::Changes`).
-4. `crates/view/src/keybindings.rs` — add `nav_target(key)`, `is_palette(key)`. For now only `h` and `c` are wired.
-5. `App::dispatch_key` checks `nav_target` after the current view's `wants_raw_keys` returns false.
-6. `App::dispatch` handles `Action::NavigateTo(ViewId)` and `Action::Back`.
-7. Tests: two-view navigation (Home → Changes → back), nav key precedence with view-local keys, `wants_raw_keys` short-circuits global nav.
+5. **Move App + Router + View enum to `apps/tui`.**
+   - Create `apps/tui/src/app.rs` with the `App` struct (move from `crates/view/src/app.rs`)
+   - Create `apps/tui/src/router.rs` with `AppDeps` and `Router::build`
+   - Create `apps/tui/src/views_enum.rs` with `enum View { Changes(ChangesView) }` (just one variant for now) and the exhaustive-match delegate methods
+   - Create `apps/tui/src/stubs.rs` (empty for now; will add Null stubs in later milestones)
+   - Delete `crates/view/src/app.rs`
+   - Update `crates/view/src/lib.rs`: `pub use chrome::*; pub use views::*;` — no more `pub use app::App`
+   - Update `apps/tui/src/main.rs`: build the `GitChangeDetector`, wrap in `RefreshChangesUseCase` etc., build `AppDeps`, build `Router`, construct `App::new(router)`, run
 
-**Verify:** `just run`. You land on Home. Press `c`, you're in Changes. Press `Esc`, you're back on Home. Press `h` from Changes, also back to Home. Press `q`, it quits.
+6. **Dependency graph check script.**
+   - Create `scripts/check_dep_graph.sh` that parses each `crates/*/Cargo.toml` and asserts: (a) `core` has no `codepeek-*` deps, (b) `git`/`syntax` depend only on `core`, (c) `view` depends only on `core`, (d) `apps/tui` may depend on anything
+   - Add to `just check` so CI fails if the graph drifts
 
-**Crates touched:** `crates/view`.
+7. **Decisions log update.**
+   - Append to `docs/decisions.md`:
+     - `2026-04-11: Reorganized core into bounded contexts (kernel, syntax, changes, …) with domain/port/error/app sub-modules per context.`
+     - `2026-04-11: Introduced application layer (use cases per context). Views hold Rc<UseCase>, not Rc<dyn Port>.`
+     - `2026-04-11: Moved Router + App + View enum from crates/view to apps/tui. Composition root is now in the binary.`
+     - `2026-04-11: Dropped Send + Sync from ChangeDetector and SyntaxHighlighter. Replaced Mutex<Repository> with RefCell<Repository>.`
+     - `2026-04-11: Presentation follows Component Architecture (ratatui template pattern), not pure TEA. Per-view state is private; the central Action enum carries only cross-cutting concerns.`
+     - `2026-04-11: Dependency-graph enforcement via scripts/check_dep_graph.sh in just check.`
 
----
+**Verify:** `just check` passes (fmt + lint + test). `just run` shows the existing Changes view UX bit-for-bit. **User pressing `q/j/k/Enter/r/Esc/d` all work identically.**
 
-### Phase B — Storage primitives
+**Crates touched:** all of them.
 
-#### Milestone 6: `codepeek-store` JSON tag store with `tempfile` atomic write
-
-**You'll see:** `codepeek-store` compiles, tests pass. `~/.config/codepeek/tags.json` can be read/written atomically. No UI yet.
-
-**What to build:**
-1. `crates/store/src/file.rs` — `TagFile { version, next_id, tags }` with `serde` derives.
-2. `crates/store/src/tags.rs` — `JsonTagStore` implementing `TagStore`. Holds `RefCell<TagFile>`. Load on construction. `add_tag` / `remove_tag` mutate inner and call `persist`.
-3. `JsonTagStore::persist`:
-   - Serialize to JSON via `serde_json::to_string_pretty`
-   - Resolve parent dir of target path; create it if missing
-   - `let temp = tempfile::NamedTempFile::new_in(parent)?;`
-   - Write JSON bytes via `temp.as_file().write_all(json.as_bytes())?;`
-   - `temp.persist(&self.path)?;` — atomic rename
-4. `crates/store/Cargo.toml` — add `tempfile.workspace = true` as a real dep.
-5. `crates/store/src/lib.rs` — re-export `JsonTagStore`.
-6. Tests using `tempfile::TempDir` for the store path:
-   - Round-trip add/list/remove
-   - Version mismatch surfaces as `Corrupt`
-   - Concurrent reads are safe (single-threaded, but verify `RefCell` borrow semantics)
-   - Atomic write: simulated mid-write panic (drop the temp file before persist) leaves the original target file intact and the temp file gone
-
-**Verify:** `just test --package codepeek-store` passes. `just check` clean.
-
-**Crates touched:** `crates/store`.
+**Git strategy:** single long-lived branch named `m1-shell-refactor`. Each sub-step is its own commit. Squash on merge if desired.
 
 ---
 
-#### Milestone 7: TagsView + tagging from FileViewerView
+### Milestone 2: Tags vertical slice
 
-**You'll see:** Press `t` from anywhere → Tags view (empty initially). Open a file, press `m` to mark the current line as a tag (Issue), `M` for Fix. Press `t` again, see the new entry. Press Enter on a tag to jump back to that file:line.
+**You'll see:** Press `t` from anywhere → TagsView (empty initially, with a helpful empty-state hint). Open a file via Changes. Press `m` to mark the current line as an Issue tag, `M` for a Fix tag. Press `t` again — see the new entry. Press Enter on a tag to jump back to that file:line. Relaunch codepeek — tags persist.
 
 **What to build:**
-1. `crates/view/src/views/tags.rs` — `TagsView`. Holds `Rc<dyn TagStore>` and a `LoadState<Vec<Tag>>`. On `on_enter`, spawns a worker that calls `store.list_tags()` (yes — even though it's likely fast, use the loading pattern uniformly so the spinner code path is exercised). Renders a list (relative time, kind badge, path, line, note).
-2. `Router::build(ViewId::Tags)` wired up.
-3. `apps/tui/src/main.rs` — replace `NullTagStore` with real `JsonTagStore::open()`. On failure, fall back to `NullTagStore` with a stderr warning.
-4. **`FileViewerView` in `views/file_viewer.rs`** holds its own `Rc<dyn TagStore>`. `handle_event`: `m` → `tag_store.add_tag(NewTag { path, line, kind: Issue, note: "" })`, `M` → `Fix`. Returns `Noop` (no global Action needed). On error, sets a local error string.
-5. Add `is_mark_issue(key)` and `is_mark_fix(key)` to `keybindings.rs`.
-6. Add `Action::OpenFileAt { path, line }`. App handles it by calling `router.build_file_viewer(path, line)` and pushing onto history.
-7. Selecting a tag in TagsView returns `Action::OpenFileAt { path, line: Some(line) }`.
-8. Tests: tag-add round-trip in TagsView, FileViewerView tag handling, jump-to-line scroll math, TagsView LoadState lifecycle.
 
-**Verify:** `just run`. Open a file (via Changes flow). Press `m` on a line. Press `t`. See the tag (with a brief spinner if list_tags is slow). Press Enter. You're back in the file at the right line. Re-launch codepeek — the tag is still there.
+1. **`tags` bounded context in core:**
+   - `crates/core/src/tags/domain.rs`: `TagId(u64)`, `TagKind` (with `#[non_exhaustive]`), `Tag` (without), `NewTag<'a>` input struct
+   - `crates/core/src/tags/port.rs`: `TagStore` trait (no `Send + Sync`)
+   - `crates/core/src/tags/error.rs`: `TagError`
+   - `crates/core/src/tags/app.rs`: `AddTagUseCase`, `ListTagsUseCase`, `RemoveTagUseCase`
+   - Unit tests with stub TagStore
 
-**Crates touched:** `crates/view`, `apps/tui`.
+2. **`store` crate (new) — JSON adapter:**
+   - `crates/store/Cargo.toml` with `serde`, `serde_json`, `dirs`, `tempfile` workspace deps
+   - `crates/store/src/lib.rs` re-exports `JsonTagStore`
+   - `crates/store/src/json_tag_store.rs`: `JsonTagStore` implementing `TagStore`
+   - `crates/store/src/file.rs`: `TagFile { version, next_id, tags }` (the on-disk shape)
+   - `persist()` uses `tempfile::NamedTempFile::new_in(parent)` + `write_all` + `persist(&self.path)`
+   - Version mismatch returns `TagError::Corrupt`
+   - Tests using `tempfile::TempDir`: add/list/remove round-trip, version mismatch handling, atomic write via crash simulation (drop the NamedTempFile before persist, verify target untouched)
+
+3. **`TagsView` in `crates/view/src/views/tags.rs`:**
+   - Holds `Rc<ListTagsUseCase>`, `Rc<RemoveTagUseCase>`, `LoadState<Vec<Tag>>`, `selected: usize`, `error_message`
+   - `on_enter` spawns a worker that calls `list_use_case.execute()` (even though it's fast, use the loading pattern uniformly)
+   - Renders a list: relative time, kind badge, path, line, note
+   - `j`/`k` navigate, `Enter` emits `Action::OpenFileAt { path, line: Some(tag.line) }`, `x` calls `remove_use_case.execute(tag.id)`
+
+4. **`FileViewerView` enhancements:**
+   - Holds `Rc<AddTagUseCase>`
+   - `handle_event`: `m` → `add_tag_use_case.execute(NewTag { path, line: cursor_line, kind: Issue, note: "" })`, `M` → `kind: Fix`
+   - On error, sets `self.error_message`
+   - Returns `Action::Noop` (the mutation is local, no cross-cutting dispatch needed)
+
+5. **`keybindings.rs` additions:** `is_mark_issue(key)`, `is_mark_fix(key)`, `is_open_tags(key)` (for `t`)
+
+6. **Update `apps/tui/src/main.rs`:** build `JsonTagStore::open()` (falling back to `NullTagStore` on failure with stderr warning); construct `AddTagUseCase`, `ListTagsUseCase`, `RemoveTagUseCase`; add to `AppDeps`; add `ViewId::Tags` to the `View` enum and `Router::build`
+
+7. **Cross-view navigation:** `keybindings::nav_target` now maps `t` → `Some(ViewId::Tags)`. `App::dispatch_key` checks `nav_target` after `wants_raw_keys`.
+
+**Verify:** Open a file, press `m`. Press `t`. See the tag. Press Enter — you're back in the file. Relaunch — tag persists. `just check` clean.
+
+**Crates touched:** `core`, `store` (new), `view`, `apps/tui`.
 
 ---
 
-### Phase C — Discovery views
+### Milestone 3: Search vertical slice
 
-#### Milestone 8: `codepeek-search` file walker + tests
-
-**You'll see:** `codepeek-search` compiles. `RipgrepLikeSearcher::find_files` and `TodoCommentScanner::scan` work against a real workdir. No UI yet.
+**You'll see:** Press `/` from any view → SearchView. Type characters into the input. Spinner blinks, then results appear. Enter opens the highlighted file.
 
 **What to build:**
-1. `crates/search/src/walk.rs` — `ignore::WalkBuilder` configured with the right defaults (respect `.gitignore`, no symlinks).
-2. `crates/search/src/files.rs` — `RipgrepLikeSearcher::find_files`. Subsequence-match the relative path (lowercased) against the lowercased query. Sort by match-span length ascending.
-3. `crates/search/src/todos.rs` — `TodoCommentScanner::scan`. Compile a `regex::Regex` once, walk files, scan each line, push `TodoItem`s. Skip binary files via the same byte heuristic as `app.rs::open_file` (first 8KB contains 0 → binary).
-4. Tests using `tempfile::TempDir`: create a fake repo with `.gitignore`, files containing TODOs, binary files, and verify expected results.
 
-**Verify:** `just test --package codepeek-search` passes. `just check` clean.
+1. **`search` context in core:** domain (`FileMatch`), port (`FileSearcher` trait), error (`SearchError`), use case (`FindFilesByQueryUseCase`)
 
-**Crates touched:** `crates/search`.
+2. **`search` crate (new) — ignore/regex adapter:**
+   - `crates/search/Cargo.toml` with `ignore` and `regex` workspace deps
+   - `RipgrepLikeSearcher` impl of `FileSearcher`
+   - Subsequence match for v1 (not full fuzzy)
+   - Tests using `tempfile::TempDir` with fake repo including `.gitignore`
+
+3. **`text_input` chrome component:** single-line input with cursor, char insertion, backspace, left/right cursor
+
+4. **`SearchView`:** holds `Rc<FindFilesByQueryUseCase>`, `repo_root`, `TextInput`, `LoadState<Vec<FileMatch>>`, `selected`; **`wants_raw_keys() -> true`** during input; each keystroke kicks off a fresh worker (replacing any in-flight receiver)
+
+5. **Router + apps/tui wiring:** `Router::build(ViewId::Search)`, dep on `find_files` use case, `NullFileSearcher` stub for fallback
+
+6. **Cross-view navigation:** `/` → `ViewId::Search`
+
+**Verify:** Press `/`, type, spinner, results, Enter opens the file.
+
+**Crates touched:** `core`, `search` (new), `view`, `apps/tui`.
 
 ---
 
-#### Milestone 9: SearchView (file finder)
+### Milestone 4: Todos vertical slice
 
-**You'll see:** Press `/` from any view → Search view. Type characters into the input. Spinner shows briefly while the search runs in a worker, then results appear. Enter opens the highlighted file. Esc closes Search.
+**You'll see:** Press `T` (capital) → TodosView. Spinner while scanning. Then grouped TODO/FIXME/HACK/XXX list across the repo. Enter jumps to file:line.
 
 **What to build:**
-1. `crates/view/src/components/text_input.rs` — single-line text input. State: `value: String`, `cursor: usize`. Renders an underlined input with cursor. Handles char insertion, backspace, delete, left/right cursor.
-2. `crates/view/src/views/search.rs` — `SearchView`. Holds `Rc<dyn FileSearcher>`, `repo_root: PathBuf`, `text_input: TextInput`, `state: LoadState<Vec<PathBuf>>`, `selected: usize`. **`wants_raw_keys() -> bool { true }`** so global nav doesn't fire while typing. On every character keystroke, kicks off a fresh worker (cancelling any in-flight one by replacing the receiver). Esc clears input on first press, exits view on second.
-3. `Router::build(ViewId::Search)` wired up.
-4. Selecting a result returns `Action::OpenFileAt { path, line: None }`.
-5. Tests: render with stub searcher, typing kicks off load, selection round-trip, raw-key mode works.
 
-**Verify:** `just run`. Press `/`. Type a partial filename. Spinner blinks, then results appear. Enter opens the file in the viewer.
+1. **`todos` context in core:** domain (`TodoItem`, `TodoKind`), port (`TodoScanner`), error (`TodoError`), use case (`ScanRepoTodosUseCase`)
 
-**Crates touched:** `crates/view`.
+2. **Reuse `search` crate** for the `TodoCommentScanner` impl (it was planned for the same crate in v2; in v3 both `FileSearcher` and `TodoScanner` adapters live in the `search` crate because they share the `ignore::Walk` configuration)
+
+3. **`TodosView`:** holds `Rc<ScanRepoTodosUseCase>`, `repo_root`, `LoadState<Vec<TodoItem>>`; groups by kind; Enter → `Action::OpenFileAt { path, line: Some(line) }`
+
+4. **Router + wiring:** `Router::build(ViewId::Todos)`, `scan_todos` use case in `AppDeps`
+
+5. **Cross-view navigation:** `T` (capital) → `ViewId::Todos`
+
+**Verify:** Press `T`, see spinner, then scanned todos, pick one, jump.
+
+**Crates touched:** `core`, `search` (extend), `view`, `apps/tui`.
 
 ---
 
-#### Milestone 10: TodosView
+### Milestone 5: Branches vertical slice
 
-**You'll see:** Press `T` (capital) → TODO/FIXME inbox view. Spinner while scanning. Then list of all TODO/FIXME/HACK/XXX comments across the workdir, with file:line and the comment text. Enter jumps to the file at that line.
+**You'll see:** Press `b` → BranchesView. Top section: branches with `*` on current. Bottom section: recent commits. Tab toggles focus. Selecting a commit opens its file list.
 
 **What to build:**
-1. `crates/view/src/views/todos.rs` — `TodosView`. Holds `Rc<dyn TodoScanner>`, `repo_root`, `state: LoadState<Vec<TodoItem>>`. On `on_enter`, spawns a worker that runs `scan(repo_root)`. Renders a list grouped by kind (TODO/FIXME/HACK/XXX).
-2. `Router::build(ViewId::Todos)` wired up.
-3. Add `T` to `nav_target` in `keybindings.rs`.
-4. Selecting an entry → `Action::OpenFileAt { path, line: Some(line) }`.
-5. Tests: render with stub scanner, grouping correctness, empty state, LoadState transitions.
 
-**Verify:** `just run`. Press `T`. See spinner briefly, then all TODOs in the project. Pick one. You're in the file at the right line.
+1. **`branches` context in core:** domain (`CommitSha([u8; 20])`, `CommitInfo`, `BranchInfo`), port (`CommitLog`), error (`BranchError`), use cases (`ListBranchesUseCase`, `RecentCommitsUseCase`, `ReadAtCommitUseCase`)
 
-**Crates touched:** `crates/view`.
+2. **Extend `GitChangeDetector`** in `crates/git/src/detector.rs` to implement `CommitLog` (in addition to `ChangeDetector`). One struct, two trait impls. Uses `self.repo.borrow()` (now `RefCell` after M1).
+
+3. **`BranchesView`:** holds `Rc<ListBranchesUseCase>`, `Rc<RecentCommitsUseCase>`, `LoadState<(Vec<BranchInfo>, Vec<CommitInfo>)>`, two selected indices, Tab-toggle focus
+
+4. **Router + wiring:** both use cases in `AppDeps`; `Rc<GitChangeDetector>` coerced to both `Rc<dyn ChangeDetector>` and `Rc<dyn CommitLog>`
+
+5. **Cross-view navigation:** `b` → `ViewId::Branches`
+
+6. **Commit opening (v1 minimal):** `Action::OpenCommit(sha)` uses the existing file viewer machinery to show the commit's diff. Full "browse files at commit" is a future plan.
+
+**Verify:** Press `b`, see branches + commits, Tab toggles, Enter opens a commit.
+
+**Crates touched:** `core`, `git`, `view`, `apps/tui`.
 
 ---
 
-### Phase D — Git extensions
+### Milestone 6: Sessions vertical slice
 
-#### Milestone 11: `CommitLog` impl on `GitChangeDetector`
-
-**You'll see:** `codepeek-git` exports a second trait impl. Tests against a real temp repo verify recent commits and branch listing. The `GitChangeDetector` struct now provides both `ChangeDetector` and `CommitLog` traits.
+**You'll see:** Press `s` → SessionsView. Spinner briefly while scanning `~/.claude/projects/<repo>`. Then the list of Claude Code sessions for this repo, newest first. Each row: short id, last-active relative time, message count, summary excerpt. Enter is a no-op in v1.
 
 **What to build:**
-1. Implement `CommitLog::recent_commits` in `crates/git/src/detector.rs`. Use `repo.borrow()` (now `RefCell` after M2).
-2. Implement `CommitLog::list_branches`.
-3. Implement `CommitLog::read_at_commit`. Returns `String` (UTF-8 decoded blob).
-4. Integration tests using `tempfile::TempDir` + `git2`: create a repo with N commits and M branches, verify trait returns them correctly. Pay attention to the newtype `CommitSha` round-trip via `git2::Oid::from_str`.
 
-**Verify:** `just test --package codepeek-git` passes. `just check` clean.
+1. **`sessions` context in core:** domain (`SessionId(Rc<str>)`, `SessionInfo`, `RawSessionInfo` cross-thread shape), port (`SessionStore`), error (`SessionError`), use case (`ListRepoSessionsUseCase`)
 
-**Crates touched:** `crates/git`.
+2. **`sessions` crate (new) — Claude JSONL adapter:**
+   - `crates/sessions/Cargo.toml` with `serde`, `serde_json`, `dirs` workspace deps
+   - `ClaudeSessionStore::discover()` + `list_sessions(&repo_root)`
+   - Path encoding: `repo.to_string_lossy().replace(['/', '.'], "-")`
+   - Streaming line reader for first+last+count (no full parse of body messages)
+   - The worker constructs `RawSessionInfo` (String ids); main thread converts to `SessionInfo` (Rc<str> ids)
+   - Tests against fixture JSONL files in `crates/sessions/tests/fixtures/`
+
+3. **`SessionsView`:** `LoadState<Vec<SessionInfo>>`; renders relative time via shared helper
+
+4. **`render_helpers` addition:** `relative_time(t: SystemTime) -> String` — returns "2m", "1h", "3d". Used by Sessions, Branches, Tags, Home.
+
+5. **Router + wiring:** `list_repo_sessions` use case in `AppDeps`; `ClaudeSessionStore::discover()` with `NullSessionStore` fallback on failure
+
+6. **Cross-view navigation:** `s` → `ViewId::Sessions`
+
+**Verify:** Press `s`, see spinner, then your Claude sessions for this repo.
+
+**Crates touched:** `core`, `sessions` (new), `view`, `apps/tui`.
 
 ---
 
-#### Milestone 12: BranchesView
+### Milestone 7: Home view with cross-context activity feed
 
-**You'll see:** Press `b` → Branches view. Spinner while loading. Top section: branch list with `*` next to current. Bottom section: recent commits on the current branch. Tab toggles focus between the sections. Selecting a commit dispatches `Action::OpenCommit(sha)` which opens a file list of changed files in that commit.
-
-**What to build:**
-1. `crates/view/src/views/branches.rs` — `BranchesView`. Holds `Rc<dyn CommitLog>`, `state: LoadState<(Vec<BranchInfo>, Vec<CommitInfo>)>`, two `selected: usize` indices (one per sub-list), `focus: BranchesFocus { Branches, Commits }`. Tab toggles focus.
-2. On `on_enter`, spawns a worker that calls both `list_branches()` and `recent_commits(RECENT_COMMITS_LIMIT)` and bundles them.
-3. `Router::build(ViewId::Branches)` wired up.
-4. Selecting a commit returns `Action::OpenCommit(sha)`.
-5. App dispatch for `OpenCommit`: build a `CommitDiffView` (small new view variant) that lists files changed in that commit using `CommitLog::recent_commits` filtering — actually, simpler: hand the SHA to a `FileViewerView`-like view that uses `CommitLog::read_at_commit` for each file. **Decision for v1:** keep it minimal — `OpenCommit(sha)` opens the *current* HEAD's diff for that single commit, file-by-file, by reusing the existing diff plumbing. The full "browse all files in a past commit" experience is a Phase F polish.
-6. Tests: render with stub commit log, branch toggle, commit selection.
-
-**Verify:** `just run`. Press `b`. See spinner briefly, then branches and commits. Pick a recent commit. See its files.
-
-**Crates touched:** `crates/view`.
-
----
-
-### Phase E — Sessions
-
-#### Milestone 13: `codepeek-sessions` JSONL reader
-
-**You'll see:** `codepeek-sessions` compiles. `ClaudeSessionStore::list_sessions(repo_root)` returns the list of sessions for the current repo with timestamps and message counts. No UI yet.
+**You'll see:** Launching codepeek lands on Home (not Changes). Home shows a stats line ("3 changes · 5 tags · 12 recent commits") and a vertical list of recent activity (edits, tags, commits) with relative timestamps. Picking an entry navigates to the right place.
 
 **What to build:**
-1. `crates/sessions/src/jsonl.rs` — minimal streaming JSONL reader. For each session file: read first message, last message, count lines. Parse only the JSON fields we need (`type`, `timestamp`, `message.role`, `message.content`, `cwd`). Use `serde_json::Value` for tolerance — sessions evolve and we don't want to break on new fields.
-2. `crates/sessions/src/store.rs` — `ClaudeSessionStore` implementing `SessionStore`. `discover()` resolves `~/.claude/projects`. `list_sessions(repo)` encodes the path, reads `.jsonl` files, returns `SessionInfo` sorted by `last_active` descending.
-3. Test using fixture jsonl files in `crates/sessions/tests/fixtures/`: a small jsonl with known timestamps, verify parsing.
 
-**Verify:** `just test --package codepeek-sessions` passes.
+1. **`ActivityEntry`, `ActivityKind`, `ActivityTarget`** in `crates/view/src/views/home.rs` (NOT in kernel, as discussed above — kernel would need to import from every bounded context)
 
-**Crates touched:** `crates/sessions`.
+2. **`ActivityFeedAggregator`** in the same file. Holds `Rc<ListTagsUseCase>`, `Rc<RefreshChangesUseCase>`, `Rc<RecentCommitsUseCase>` (the fast-read sources). Method `collect(limit) -> Vec<ActivityEntry>` merges and sorts by timestamp.
 
----
+3. **`HomeView`** holds `ActivityFeedAggregator`, `LoadState<Vec<ActivityEntry>>`. `on_enter` spawns a worker — but the aggregator's use cases are `!Send`. Two options:
+   - **Option A (preferred):** the aggregator is constructed synchronously on the main thread, and `execute(limit)` is called on the main thread (no worker). The use cases hit are all fast (`list_tags`, `detect_changes`, `recent_commits`) — each <50ms, so total is <200ms. Acceptable block.
+   - **Option B:** factory closures passed into the worker to construct fresh store instances. Complex; not worth it for v1.
+   - **v3 decision: Option A.** Home's feed aggregates only from fast sources; slow sources (sessions, todos, search) are not included in the feed. The stats line shows "sessions: see s" and "todos: see T" instead of counts.
 
-#### Milestone 14: SessionsView
-
-**You'll see:** Press `s` → Sessions view. Spinner while loading. Then list of Claude Code sessions for this repo, most recent first. Each row: short id, last active (relative time), message count, summary excerpt. Enter on a session is a no-op for v1.
-
-**What to build:**
-1. `crates/view/src/views/sessions.rs` — `SessionsView`. Holds `Rc<dyn SessionStore>`, `repo_root`, `state: LoadState<Vec<SessionInfo>>`. On `on_enter`, spawns a worker that calls `list_sessions(repo_root)`.
-2. `Router::build(ViewId::Sessions)` wired up.
-3. `apps/tui/src/main.rs` — replace stub with real `ClaudeSessionStore::discover()`.
-4. Add a relative-time formatter ("2m", "1h", "3d") in `render_helpers.rs` — used by Sessions, Branches, Tags, and Home's activity feed.
-5. Tests: stub store, render, sort order, LoadState transitions.
-
-**Verify:** `just run`. Press `s`. Spinner briefly, then your Claude Code sessions for this repo, sorted newest-first.
-
-**Crates touched:** `crates/view`, `apps/tui`.
-
----
-
-### Phase F — Polish
-
-#### Milestone 15: Command palette overlay
-
-**You'll see:** Press `:` → centered overlay with a text input and a fuzzy-filtered list of commands. Type to filter, Enter to invoke. Esc closes.
-
-**What to build:**
-1. `crates/view/src/components/command_palette.rs` — `CommandPalette`. Holds a `TextInput` (from M9) and a static `Vec<PaletteCommand>`. Filters by subsequence match. Selecting a command emits the corresponding `Action`. **`wants_raw_keys` analog at App level:** when palette is `Some`, App routes events to the palette before checking nav keys (already handled by the dispatch order in M4).
-2. The command list (v1):
-   - Go to Home / Changes / Sessions / Search / Tags / Branches / Todos
-   - Refresh
-   - Quit
-3. The palette is part of `App` state, not a View enum variant — it's an overlay on top of the current view, not a replacement.
-4. Tests: filter behavior, command-to-action mapping.
-
-**Verify:** `just run`. Press `:`. Type "sess". Pick "Go to Sessions". You're in Sessions.
-
-**Crates touched:** `crates/view`.
-
----
-
-#### Milestone 16: Activity feed in Home
-
-**You'll see:** Home view now shows a real activity feed: stats in the title (X changed, Y sessions, Z tags), and a vertical list of recent activity with relative timestamps. Selecting an entry navigates to the right place.
-
-**What to build:**
-1. `crates/view/src/views/home.rs` (extended) — `ActivityFeedAggregator` struct in the same file. Holds `Rc` clones of every store. Has a `collect(limit)` method that pulls from each source, merges, sorts by `when` descending, truncates.
-2. `HomeView` holds the aggregator and a `LoadState<Vec<ActivityEntry>>`. `on_enter` spawns a worker that calls `aggregator.collect(HOME_ACTIVITY_LIMIT)`.
-3. The stats line in the title is computed from the loaded data (counts per `ActivityKind`).
-4. Selection emits the contextual action based on `entry.target`:
-   - `File { path }` → `Action::OpenFileAt { path, line: None }`
+4. **Selection dispatch** — each activity kind maps to an Action:
+   - `FileEdit { path }` → `Action::OpenFileAt { path, line: None }`
    - `Commit { sha }` → `Action::OpenCommit(sha)`
-   - `Session { id: _ }` → `Action::NavigateTo(ViewId::Sessions)` (selection-into-list is a future plan)
    - `Tag { id: _ }` → `Action::NavigateTo(ViewId::Tags)`
+   - `Session { id: _ }` → `Action::NavigateTo(ViewId::Sessions)`
    - `Todo { path, line }` → `Action::OpenFileAt { path, line: Some(line) }`
-   - `None` → `Action::Noop`
-5. **Aggregator worker design:** because the stores are `Rc<dyn …>` (not `Send`), the aggregator can't be sent into a thread. Two options:
-   - **Option A (chosen):** the aggregator runs synchronously in the worker by constructing fresh impls inside the worker (the binary's `main.rs` would expose factory closures, or we accept a tight coupling and re-`discover()` each store inside the worker).
-   - **Option B:** the aggregator runs synchronously on the main thread because individual store calls are usually fast (list_tags is a JSON read, recent_commits is a git call). Only sessions and todos are slow, and they're already shown in their dedicated views.
-   - **For v1: Option B.** The Home aggregator runs *only* the fast sources (tags + recent commits + recent edited files via filesystem mtime walk). Sessions and todos are excluded from Home's activity feed in v1 and the stats line shows them as "(not loaded)". The user gets sessions/todos by navigating to those views directly. Documenting this trade-off honestly in M16 keeps the loading model simple.
-6. Tests: aggregator with stub stores, sort order, target dispatch, stats counts.
 
-**Verify:** `just run`. Land on Home. See real activity. Pick a tag → Tags. Pick a commit → CommitDiff. Pick an edit → opens the file. Stats are accurate (excluding sessions/todos counts).
+5. **`App::new` builds `Home` as the initial view** (was `Changes` in M1)
 
-**Crates touched:** `crates/view`.
+6. **Cross-view navigation:** `h` → `ViewId::Home`
+
+7. **Empty Home handling:** if activity is empty (new repo, no tags, no commits), render a "Welcome to codepeek" panel with a one-line hint for each top-level view + its nav key
+
+**Verify:** Relaunch codepeek. You land on Home. See a stats line + activity. Pick a tag → Tags view. Pick an edit → file opens. Pick a commit → commit diff opens.
+
+**Crates touched:** `view`, `apps/tui`.
 
 ---
 
-#### Milestone 17: Polish, edge cases, final tests, decisions log
+### Milestone 8: Command palette
 
-**You'll see:** Everything works smoothly together. Empty states are handled. Errors don't crash. `just check` is clean. `docs/decisions.md` updated.
+**You'll see:** Press `:` → centered overlay with a text input and a filtered command list. Type to filter, Enter to invoke. Esc closes.
 
 **What to build:**
-1. **Empty states:** every view renders a useful message when its data is empty. Home: "No recent activity". Sessions: "No Claude Code sessions for this repo". Tags: "No tags yet — press `m` while viewing a file to add one". Etc.
+
+1. **`command_palette.rs` in `chrome/components/`** — holds a `TextInput`, a static `Vec<PaletteCommand>`, subsequence filter. Emits the corresponding `Action` on Enter.
+
+2. **Command list v1:** Go to Home/Changes/Sessions/Search/Tags/Branches/Todos, Refresh, Quit. Each is a nav or direct Action.
+
+3. **`App` state:** `palette: Option<CommandPalette>`. When `Some`, App routes events to the palette before global nav.
+
+4. **`keybindings::is_palette`** → `:` or `Ctrl+P`
+
+**Verify:** Press `:`, type "sess", pick "Go to Sessions", you're in Sessions.
+
+**Crates touched:** `view`, `apps/tui`.
+
+---
+
+### Milestone 9: Polish, final tests, decisions log
+
+**You'll see:** Everything works smoothly. Empty states are handled. Errors don't crash. Narrow terminals still work. `just check` is clean. Docs updated.
+
+**What to build:**
+
+1. **Empty states** in every view: Home ("No recent activity"), Sessions ("No Claude sessions for this repo"), Tags ("No tags yet — press `m` while viewing a file to add one"), etc.
+
 2. **Error states:** every view's `LoadState::Failed` renders through `ErrorBar`.
-3. **Refresh:** `r` works in every view that has a refreshable data source. Wired through `View::on_enter` after a Refresh action.
-4. **Navigation conflicts:** verify that `j`/`k` still scroll inside FileViewer and don't trigger global nav. Verify `t` doesn't fire while typing in Search.
-5. **Status bar:** every view's hints + global nav hints render. On narrow terminals, drop the global hints.
-6. **Performance check:** `T` (Todos) on a large repo (10k files) — the spinner should be smooth, the UI shouldn't freeze. If it does, that means the worker is starving the main thread and we have a bug.
+
+3. **Refresh consistency:** `r` works in every view that has a refreshable data source. Wired through `View::on_enter` after `Action::Refresh`.
+
+4. **Navigation-conflict tests:** `j/k` scroll inside FileViewer without triggering global nav. `t` doesn't fire while typing in Search. 
+
+5. **Status bar budget:** `h c s / t b T : q` is 9 hints, ~30 characters. Show only when terminal width ≥ 120 cols. Threshold in `config.rs`.
+
+6. **Performance check:** press `T` on a large repo (10k files). Spinner should animate smoothly, UI shouldn't freeze. If it does, the worker is starving the main thread — bug.
+
 7. **Theme audit:** new components use only theme tokens, no raw palette colors.
-8. **Documentation:** update `README.md` with the new commands. Update `docs/decisions.md` with the architectural decisions made in this plan:
-   - 2026-04-08: View enum (closed-set static dispatch) for top-level views
-   - 2026-04-08: Rc<dyn Trait> for store injection (single-threaded design)
-   - 2026-04-08: LoadState<T> + std::sync::mpsc for background data loading (no tokio)
-   - 2026-04-08: Hierarchical Action enum, view-local handling for non-cross-cutting actions (Component Architecture)
-   - 2026-04-08: Newtype IDs (TagId, SessionId, CommitSha) for compile-time type safety
-   - 2026-04-08: tempfile::NamedTempFile::persist for atomic JSON writes
-   - 2026-04-08: Three new crates (sessions, search, store) for dependency isolation
-   - 2026-04-08: Removed Send + Sync from ChangeDetector and SyntaxHighlighter; GitChangeDetector uses RefCell<Repository>
-   - 2026-04-08: View enum delegate methods use exhaustive match per variant (no `_ =>` wildcards) to preserve compile-time enforcement
-   - 2026-04-08: Spinner advances every 6th poll tick (~10fps) via `TICKS_PER_FRAME` constant
-   - 2026-04-08: status_hints returns `Cow<'_, [(&'static str, &'static str)]>` for state-dependent hints without breaking the trait
-   - 2026-04-08: thiserror `#[from]` used for ergonomic `?` auto-conversion; `#[source]` reserved for variants needing explicit `.map_err()`
-   - 2026-04-08: `Box<dyn Error + Send + Sync>` retained inside error variants — explicit exception to the single-threaded design rule
-9. `just check` is clean (fmt + lint + test).
 
-**Verify:** Use codepeek for a day on a real project. Try every view. Try edge cases (empty repo, repo with no sessions, large repo, narrow terminal). Nothing crashes; everything degrades gracefully.
+8. **v3 naming audit:** every `docs/decisions.md` entry from v3 is present; `crates/view/src/chrome/action.rs` has a module doc comment referencing the Component Architecture decision.
 
-**Crates touched:** `crates/view`, `apps/tui`, root docs.
+9. **README update:** new commands, view map, the "view dev guide" (how to add a new view: add a bounded context in `core/`, add a new adapter crate, add a view struct, add an enum variant + exhaustive matches, add to Router, add to AppDeps, add to main.rs).
+
+10. **Profile the `Rc<str>` vs `String` choice for `SessionId`.** If `String` baseline is fine for the 100-session scale, revert the `RawSessionInfo`/`SessionInfo` split and document the simpler choice in decisions.md.
+
+11. **Run the dep-graph check script** in CI to confirm no accidental cycles introduced.
+
+**Verify:** Use codepeek for a real work day. Everything feels solid.
+
+**Crates touched:** `view`, `apps/tui`, docs.
 
 ---
 
 ### Milestone summary
 
-| # | Phase | Name | What you'll see | Key crates |
-|---|-------|------|----------------|------------|
-| 1 | A | Crate scaffolding | 8 crates compile | sessions, search, store, root |
-| 2 | A | Core types + drop Send+Sync | New types, RefCell repo | core, git |
-| 3 | A | LoadState + Spinner | Internal infrastructure | view |
-| 4 | A | View enum + Router refactor | Old UX preserved, new internals | view, tui |
-| 5 | A | HomeView stub + cross-view nav | Lands on Home, `c`→Changes, `h`→Home | view |
-| 6 | B | JsonTagStore (atomic via tempfile) | Tags persist (no UI yet) | store |
-| 7 | B | TagsView + tagging | `m` marks, `t` lists, jump works | view, tui |
-| 8 | C | search crate | File walker + TODO scanner tested | search |
-| 9 | C | SearchView | `/` opens fuzzy file finder with spinner | view |
-| 10 | C | TodosView | `T` lists all TODOs with spinner | view |
-| 11 | D | CommitLog impl | git2 commits/branches via trait | git |
-| 12 | D | BranchesView | `b` shows branches + commits | view |
-| 13 | E | sessions crate | JSONL reader tested | sessions |
-| 14 | E | SessionsView | `s` lists Claude sessions with spinner | view, tui |
-| 15 | F | Command palette | `:` opens fuzzy command picker | view |
-| 16 | F | Activity feed in Home | Home shows real merged activity | view |
-| 17 | F | Polish + decisions log | Edge cases, empty states, docs | view, tui, docs |
+| # | Name | Delivers | Key crates | Risk |
+|---|------|----------|------------|------|
+| 0 | Pre-refactor hygiene | Drop Send+Sync; Mutex→RefCell | core, git | **Low** |
+| 1 | Shell refactor | v3 architecture in place, existing UX unchanged | all | **High** |
+| 2 | Tags slice | `m` mark, `t` list, persistence | core/tags, store, view, tui | Medium |
+| 3 | Search slice | `/` fuzzy file finder | core/search, search, view, tui | Medium |
+| 4 | Todos slice | `T` todo inbox | core/todos, search, view, tui | Low |
+| 5 | Branches slice | `b` branches + commits | core/branches, git, view, tui | Medium |
+| 6 | Sessions slice | `s` Claude sessions | core/sessions, sessions, view, tui | Medium |
+| 7 | Home + activity | Home landing with cross-context feed | view, tui | Medium |
+| 8 | Command palette | `:` overlay | view, tui | Low |
+| 9 | Polish + docs | empty states, perf, decisions log | all | Low |
 
-**First runnable with new architecture:** Milestone 4 (refactor preserves existing UX)
-**First user-visible new feature:** Milestone 5 (Home placeholder + nav)
-**First "this looks like a real multi-view tool":** Milestone 7 (Tags)
-**Background loading proven end-to-end:** Milestone 9 (Search with worker)
-**Foundation complete:** Milestone 12 (4 of 6 new views shipped)
-**Feature-complete v1:** Milestone 16 (activity feed lit up)
-**Ship-ready:** Milestone 17 (polish + docs)
+**First runnable with v3 architecture:** M1 (refactor is transparent).
+**First user-visible new feature:** M2 (Tags).
+**Background loading proven end-to-end:** M3 (Search with worker).
+**Full view set minus Home:** M6.
+**Feature-complete:** M7 (Home lights up the activity feed).
+**Ship-ready:** M9 (polish).
 
 ---
 
 ## What we're NOT doing
 
-- **No `tokio` / no async runtime.** Background work is `std::thread::spawn` + `std::sync::mpsc`. If a future plan needs futures composition, cancellation tokens, or massive concurrency, *that* plan introduces tokio and migrates the workers.
-- **No worker cancellation.** If the user navigates away mid-load, the worker finishes and drops its result on the floor (the receiver is dropped, the send fails silently). Acceptable because workers are short-lived (≤500ms).
-- **No streaming results.** A worker either returns the full `Vec<T>` or fails. Partial results during a long scan would require a more complex channel protocol — out of scope.
-- **No background refresh / file watchers.** Data refreshes only on view enter or explicit `r` press. No inotify, no polling.
+- **No `tokio` / no async runtime.** Background work is `std::thread::spawn` + `std::sync::mpsc`. Future plan if needed.
+- **No worker cancellation.** Workers are short-lived.
+- **No streaming results.** `Vec<T>` or fail.
+- **No background refresh / file watchers.** Data refreshes only on view enter or explicit `r`.
 - **No tab strip / multi-pane chrome.** Zen mode preserved. Command palette is the only persistent visual addition.
-- **No view-local config files.** All new behavior reads from the existing `~/.config/codepeek/config.toml` if it needs configuration.
-- **No runtime view registration.** The `View` enum is fixed at compile time. Plugin systems are not in scope.
-- **No tag editing UI.** v1 lets you add and remove tags but not edit notes — edit by remove + re-add.
-- **No session launching.** SessionsView is read-only.
+- **No view-local config files.** Existing `~/.config/codepeek/config.toml` handles everything.
+- **No runtime view registration.** The `View` enum is fixed at compile time.
+- **No tag editing UI.** Add + remove; edit = remove + re-add in v1.
+- **No session launching.** SessionsView is read-only in v1.
 - **No commit graph visualization.** BranchesView is a flat list.
-- **No fuzzy match library** (e.g. `nucleo`). Subsequence matching is good enough for v1.
-- **No new keybindings UI.** Keys are hardcoded in `keybindings.rs`.
-- **No cursor mode in FileViewer.** Tagging uses "the line at the top of visible scroll" as the current line.
-- **No command palette command history.** Every `:` opens fresh.
-- **No `enum_dispatch` macro.** Manual `match` boilerplate in `views.rs` is clear and adds no dependency.
-- **Sessions and Todos are NOT included in Home's activity feed in v1** (the aggregator runs synchronously on the main thread and only pulls from fast sources). The user gets sessions/todos via direct navigation (`s`/`T`). Adding them to Home requires an async aggregator pattern — its own follow-up plan.
+- **No fuzzy match library.** Subsequence matching is good enough for v1.
+- **No new keybindings UI.** Hardcoded in `keybindings.rs`.
+- **No cursor mode in FileViewer.** Tagging uses "line at top of visible scroll" as the current line.
+- **No command palette history.** Every `:` opens fresh.
+- **No `enum_dispatch` macro.** Manual exhaustive match in `views_enum.rs` per Rust notebook's verdict.
+- **Sessions and Todos NOT in Home's activity feed in v1.** Home's aggregator runs synchronously; only fast sources (Tags, Changes, Recent commits) contribute. Adding Sessions/Todos requires an async aggregator — its own future plan.
+- **No Command/Query Bus.** Use cases are injected directly. A bus is a future refactor if cross-cutting concerns (audit logging, command history) appear.
+- **No `RenderContext<'a>` refactor of the highlighter.** The Rust notebook suggested this as an alternative to `Rc<RefCell<dyn SyntaxHighlighter>>`. v3 ships with the Rc version and revisits if the runtime borrow check ever panics in practice.
+- **No Shared Kernel crate split.** The kernel is a module inside `core`, not a separate crate. One crate per bounded context would be more "Screaming" but costs compile time and crate-boilerplate more than it's worth at codepeek's scale.
 
 ---
 
-## Architectural decisions (resolved during v2 review against the rust-style-guide notebook)
+## Architectural decisions resolved
 
-These were Open Decisions in the v1 plan that the notebook resolved:
+### Resolved in v2 (rust-style-guide review) — preserved in v3
 
-1. **`Box<dyn View>` vs enum-dispatch:** Resolved → `enum View`. The set is closed; exhaustive matches and zero-allocation navigation win.
-2. **`Arc` vs `Rc` for store injection:** Resolved → `Rc`. Single-threaded design, Clippy `arc_with_non_send_sync` would flag the alternative.
-3. **`Mutex` vs `RefCell` for `GitChangeDetector` interior mutability:** Resolved → `RefCell`. Same reasoning. Drop `Send + Sync` from `ChangeDetector` and `SyntaxHighlighter` traits.
-4. **Hand-rolled `<path>.tmp` + rename vs `tempfile`:** Resolved → `tempfile::NamedTempFile::persist()`. Crash safety, race safety, less code.
-5. **Synchronous I/O on view enter vs background loading:** Resolved → `LoadState<T>` + `mpsc::channel` + `std::thread::spawn` from M3 onward. Synchronous would freeze the render loop on real repos.
-6. **Flat Action enum vs hierarchical / Component Architecture:** Resolved → Component Architecture. Strip the global enum to cross-cutting concerns; each view handles its own state mutations internally.
-7. **`Vec<(&'static str, &'static str)>` vs `&'static [...]` vs `Cow<'_, [...]>` for status hints:** Resolved → `Cow<'_, [(&'static str, &'static str)]>`. Strictly more general than a bare static slice while preserving the zero-allocation common case (`Cow::Borrowed(STATIC_HINTS)`). Future views with state-dependent hints (FileViewer's diff toggle, Tags' selection-aware "remove" hint) return `Cow::Owned(vec![…])` without breaking the trait signature.
-8. **Positional `add_tag(path, line, kind, note)` vs struct input:** Resolved → `add_tag(NewTag<'_>)`. Future-proof against new fields.
-9. **Raw `u64` / `String` IDs vs newtype wrappers:** Resolved → newtypes (`TagId`, `SessionId`, `CommitSha`). Zero runtime cost, prevents parameter mix-ups.
-10. **`views/mod.rs` vs `views.rs` sibling:** Resolved → sibling file (`views.rs` + `views/`). Modern Rust 2018+ idiom, matches Ratatui's component template.
-11. **`wants_raw_keys() -> bool` flag:** Validated as idiomatic — standard opt-in capability pattern with default impl.
-12. **Per-domain `thiserror` enums:** Validated. Avoid "ball of mud," descriptive names (not all `Error`).
-13. **Three new crates (sessions, search, store):** Validated. Aligns with "Prefer Small Crates" pattern and Ratatui's own architecture.
-14. **Delegate-method pattern in `View` enum:** Resolved → **Pattern B** (exhaustive match per variant, no `_ =>` wildcards). Enum dispatch is only worth the boilerplate if it preserves exhaustiveness; wildcard arms throw away the compile-time safety the enum was chosen for. ~30 extra lines of trivial method definitions per view, paid back the first time a future view needs to opt into raw-key mode.
-15. **Spinner frame rate cap:** Resolved → `TICKS_PER_FRAME = 6` constant in `spinner.rs`. `LoadState::poll` runs at ~60fps, but the spinner advances every 6th tick (~10fps) to match conventional loading-indicator pacing. Tweakable in one place.
-16. **`#[from]` vs `#[source]` on error variants:** Resolved → use `#[from]` wherever the `?` operator should auto-convert; reserve `#[source]` for variants that need a `.map_err()` call site (typically when two variants wrap the same source type with different context).
-17. **`Box<dyn Error + Send + Sync>` inside error chains:** Resolved → kept as-is. The bound is free (every wrapped type is already `Send + Sync`), it matches Rust ecosystem convention, and it future-proofs error propagation through `mpsc::channel`. This is the one explicit exception to the "drop `Send + Sync`" rule.
+1. **`Box<dyn View>` vs enum-dispatch:** `enum View`. Closed set, exhaustive matches, no allocation.
+2. **`Arc` vs `Rc` for shared ownership:** `Rc`. Single-threaded design.
+3. **`Mutex` vs `RefCell` for interior mutability:** `RefCell`. Same reasoning.
+4. **Hand-rolled `.tmp` + rename vs `tempfile`:** `tempfile::NamedTempFile::persist()`. Crash + race safety.
+5. **Sync I/O on view enter vs background loading:** `LoadState<T>` + mpsc + `std::thread::spawn`.
+6. **Flat vs hierarchical Action enum:** hierarchical (cross-cutting only); per-view state mutations inline.
+7. **Status hints shape:** `Cow<'_, [(&'static str, &'static str)]>`.
+8. **`add_tag(positional args)` vs `add_tag(NewTag)`:** input struct for stable signatures.
+9. **Raw IDs vs newtypes:** newtypes for type safety.
+10. **`views/mod.rs` vs sibling file:** sibling file (Rust 2018+ idiom).
+11. **`wants_raw_keys` flag:** idiomatic opt-in capability pattern.
+12. **Per-domain `thiserror` enums:** validated. Avoid ball-of-mud.
+13. **Small adapter crates per external dep:** validated. Matches Ratatui's architecture.
+14. **Delegate pattern in View enum:** Pattern B exhaustive match, no `_ =>` wildcards.
+15. **Spinner frame-rate cap:** `TICKS_PER_FRAME = 6`.
+16. **`#[from]` vs `#[source]`:** prefer `#[from]`; `#[source]` only for context-dependent wrapping.
+17. **`Box<dyn Error + Send + Sync>` inside error variants:** kept as-is. Explicit exception.
+
+### Resolved in v3 (software-architecture-guide review + second rust-style-guide pass)
+
+18. **Package by tool vs package by component (bounded contexts):** **bounded contexts** at the module level, inside stable crate boundaries. `core` has `changes/`, `tags/`, `sessions/`, `search/`, `todos/`, `branches/`, `kernel/`, `syntax/`.
+19. **Application layer (use cases):** **introduced.** Views hold `Rc<UseCase>`, not raw port traits. Every mutation goes through a use case. CQRS read-side lets `home` aggregator read directly.
+20. **Composition root placement:** **`apps/tui`.** Router, App, View enum all move from `crates/view` to `apps/tui`. The view crate is chrome + per-context views only.
+21. **Milestone phasing:** **vertical slices.** Nine context-focused milestones instead of seventeen technical phases.
+22. **`#[non_exhaustive]` scope:** **open enums only,** not Data Objects. Walks back v2's "all types get it" instruction.
+23. **`CommitSha` type:** **`[u8; 20]`** with hex encoding for display/serde. Avoids heap allocation on every dispatch.
+24. **`SessionId` type:** **`Rc<str>`** on the main thread, with `RawSessionInfo { id: String }` cross-thread shape. Profile in M9 and revert to `String` if not worth the machinery.
+25. **Component Architecture explicit naming:** **documented in `docs/decisions.md`, `chrome/action.rs` module docs, and `README.md` view-dev guide.** Acknowledges the departure from pure TEA.
+26. **Shared Kernel scope:** **minimal** — just `highlight` types and the `syntax` port. `ActivityEntry` lives in `home.rs`, not kernel, to preserve acyclic layering.
+27. **Dependency-graph enforcement:** **`scripts/check_dep_graph.sh` in `just check`** to prevent drift.
 
 ---
 
-## Open decisions (still need to resolve at implementation time)
+## Open decisions (still to resolve at implementation time)
 
-1. **`enum_dispatch` macro adoption.** Manual `match` plumbing in `views.rs` is ~80 lines. If it becomes painful when adding views beyond v1, revisit. **Lean:** stay manual until view #10.
+1. **`enum_dispatch` macro adoption.** Manual `match` plumbing in `views_enum.rs` is ~70 lines. Stay manual until view #10.
 
-2. **`OpenCommit(sha)` rendering.** v1 reuses the existing diff plumbing for "current HEAD changes" view to render a past commit's diff. The user experience for this is rough — you're seeing the *commit's diff*, not the *file at that commit*. A future plan could add a proper `CommitView` that uses `read_at_commit` to show files at that commit. **Lean for v1:** ship the rough version, document the limitation.
+2. **`OpenCommit(sha)` rendering quality.** v1 reuses the existing diff plumbing for "current HEAD changes" to render a past commit's diff. The UX is rough (you see the commit's diff, not the file *at* that commit). Future plan could add a proper commit browser. **Lean:** ship the rough version, document the limitation.
 
-3. **Tag store concurrency.** Two codepeek processes mutating the same JSON file would race. `tempfile::persist` is atomic per write, but the read-modify-write cycle isn't. **Lean:** v1 ignores it; document as a known limitation.
+3. **Tag store concurrency across codepeek instances.** Two processes mutating the same JSON file race on read-modify-write. Atomic writes protect single operations, not sequences. **Lean:** v1 ignores; document as known limitation.
 
-4. **Sessions: encode-path edge cases.** What if the repo path contains characters Claude encodes differently than `/` and `.`? Test against the user's actual `~/.claude/projects/` directory list during M13.
+4. **Sessions path-encoding edge cases.** What if repo path contains characters Claude encodes differently than `/` and `.`? Test against actual `~/.claude/projects/` directory list in M6.
 
-5. **Status bar global hints budget.** `h c s / t b T : q` is 9 hints, ~30 characters with separators. Threshold for showing them is "terminal width ≥ 120 cols". Tunable in `config.rs`.
+5. **Status bar global-hints threshold.** 120 cols is the current guess; tunable.
 
-6. **Empty Home behavior.** When the repo has no activity at all, show a "Welcome to codepeek" panel with one-line descriptions of each view + their nav keys. Cheap to add in M16.
+6. **Search debounce.** Each keystroke kicks off a worker. Fast typist → 5 workers in flight. `ignore::Walk` is fast but not free. **Lean:** add 50ms debounce if it shows in M9 perf testing.
 
-7. **Should Search debounce keystrokes?** Each character press kicks off a worker. On a fast typist, that's 5+ workers in flight, all scanning the same repo. `ignore::Walk` is fast but not free. **Lean:** add a 50ms debounce timer if it shows up in performance testing in M17. v1 ships without debounce.
+7. **`Rc<GitChangeDetector>` coercion ergonomics.** The "two `Rc`s, one allocation" pattern in `main.rs` feels awkward. Alternative: `pub trait GitOps: ChangeDetector + CommitLog {}` super-trait and a single `Rc<dyn GitOps>`. Trade-off: super-trait adds an indirection. **Lean:** ship the awkward pattern; revisit if it shows up at more adapter call sites.
 
-8. **`Rc<GitChangeDetector>` coercion ergonomics.** The "two `Rc`s, one allocation" pattern in main.rs feels awkward. Alternative: define a `pub trait GitOps: ChangeDetector + CommitLog {}` super-trait and have a single `Rc<dyn GitOps>`. Trade-off: super-trait adds an indirection for callers that only need one trait. **Lean:** ship the awkward pattern in M11; revisit if it shows up at more call sites.
+8. **`RenderContext<'a>` for the syntax highlighter.** The rust notebook suggested threading `&mut SyntaxHighlighter` through the render path instead of `Rc<RefCell<dyn>>`. Trade-off: eliminates runtime borrow-check panic risk, but requires every `render` method to take a new parameter. **Lean:** ship with `Rc<RefCell<dyn>>`. Revisit if a runtime borrow panic ever shows up in practice.
+
+9. **`SessionId(Rc<str>)` vs `SessionId(String)`.** Profile in M9. The `RawSessionInfo`/`SessionInfo` split adds machinery; simpler `String` may be fine at the 100-session scale. **Decision gated on M9 measurement.**
+
+10. **Vertical-slice crate split (future).** If the `core` crate's bounded-context modules start stepping on each other at compile time, split into per-context crates (`codepeek-changes`, `codepeek-tags`, etc.). **Threshold:** when `cargo check` in the `core` crate takes >10s on a clean build, extract the most-churned context. Until then, modules inside one crate are simpler.
+
+---
+
+## Appendix: how to add a new bounded context (view-dev guide)
+
+A future contributor should be able to add a new bounded context (e.g. "diagnostics") by following these steps:
+
+1. **Domain + application layer:**
+   - Create `crates/core/src/diagnostics/{mod.rs,domain.rs,port.rs,error.rs,app.rs}`
+   - Define entities/value objects in `domain.rs`
+   - Define a `DiagnosticsStore` trait in `port.rs` (no `Send + Sync`)
+   - Define `DiagnosticsError` in `error.rs` (own variants, use `thiserror`)
+   - Define use cases in `app.rs` (`ListDiagnosticsUseCase`, etc.)
+   - Re-export from `crates/core/src/lib.rs`
+
+2. **Infrastructure adapter:**
+   - If the adapter has distinct external deps, create `crates/diagnostics_lsp/` or similar
+   - Otherwise, add to an existing adapter crate (e.g. `crates/search` extended)
+   - Implement the port trait
+
+3. **Presentation:**
+   - Create `crates/view/src/views/diagnostics.rs` with a `DiagnosticsView` struct
+   - Hold the relevant `Rc<UseCase>` instances
+   - Implement the methods matching the `View` enum delegates: `title`, `status_hints`, `handle_event`, `render`, `on_enter`, `poll_loading`, `wants_raw_keys`
+
+4. **Composition root:**
+   - Add `ViewId::Diagnostics` to `apps/tui/src/views_enum.rs`
+   - Add a `View::Diagnostics(DiagnosticsView)` variant
+   - Add the variant to **every** delegate method's exhaustive match — the compiler forces this
+   - Add the use cases to `apps/tui/src/router.rs::AppDeps`
+   - Add `Router::build(ViewId::Diagnostics)` arm
+   - Build the adapter + use cases in `apps/tui/src/main.rs` and pass to the `AppDeps`
+
+5. **Navigation:**
+   - Add a single-letter key to `keybindings::nav_target` if top-level navigable
+   - Add to the command palette's command list (M8)
+
+6. **Tests:**
+   - Unit tests for the use cases in `core/diagnostics/app.rs` using a stub `DiagnosticsStore`
+   - Integration tests for the view in `view/views/diagnostics.rs` using a stub view + `TestBackend`
+
+7. **Decisions log:**
+   - Add an entry to `docs/decisions.md` describing why the context was added and any non-obvious trade-offs
+
+The compiler enforces that every new view updates every delegate method (that's the whole point of Pattern B), so forgetting a step is impossible.
+
+---
+
+## Appendix: reading this plan
+
+- **Architecture section** defines the rules (principles, layering, bounded contexts, crate/module layout, dependency graph).
+- **Bounded context sections** show the domain/port/error/app shape for each context, with enough code to verify types compile.
+- **Presentation layer section** covers the cross-cutting UI machinery (View enum, App, Router, chrome components).
+- **Composition root section** shows how everything wires together in `apps/tui/src/main.rs`.
+- **Rust-level refinements** lists the v3 deltas from v2 with the reasoning.
+- **Sequence diagrams** illustrate the hot flows (add tag, navigate with load, refresh).
+- **Milestones** break the work into nine slices, each a complete vertical through a bounded context.
+- **What we're NOT doing** lists the explicit non-goals so future PR reviews can flag scope creep.
+- **Architectural decisions resolved** is the authoritative decisions log for this plan (ported to `docs/decisions.md` in M9).
+- **Open decisions** are things we'll resolve at implementation time, with leans.
+- **Appendices** are the view-dev guide and reading guide.
